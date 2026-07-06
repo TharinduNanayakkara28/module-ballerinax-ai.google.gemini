@@ -1,0 +1,9 @@
+[plugin]
+id = "ai-compiler-plugin"
+class = "io.ballerina.lib.ai.google.gemini.AiGeminiCompilerPlugin"
+
+[[dependency]]
+path = "../compiler-plugin/build/libs/ai.google.gemini-compiler-plugin-@project.version@.jar"
+
+[[dependency]]
+path = "../compiler-plugin/build/libs/ballerina-to-openapi-@ballerinaToOpenApiVersion.version@.jar"
