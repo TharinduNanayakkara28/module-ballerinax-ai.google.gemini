@@ -153,6 +153,21 @@ function testGenerateStringReturnType() returns error? {
 }
 
 @test:Config
+function testGenerateNestedRecordReturnType() returns error? {
+    Person person = check provider->generate(`Extract the person from: Ada, 36, London, UK`);
+    test:assertEquals(person, personRecord);
+}
+
+@test:Config
+function testGenerateMapReturnTypeIsUnsupported() returns ai:Error? {
+    // Top-level `map<T>` return types are not supported by the schema generator yet;
+    // the connector surfaces this as an ai:Error rather than a panic.
+    map<int>|ai:Error scores = provider->generate(`Score the items out of 10`);
+    test:assertTrue(scores is ai:Error, "expected an error for an unsupported map return type");
+    test:assertTrue((<ai:Error>scores).message().includes("Runtime schema generation is not yet supported"));
+}
+
+@test:Config
 function testGenerateForwardsGenerationConfig() returns ai:Error? {
     // The mock asserts temperature/maxOutputTokens/responseMimeType are present.
     int result = check provider->generate(`Config check: rate this out of 10`);

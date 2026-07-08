@@ -199,6 +199,12 @@ isolated function getMockResultText(string message) returns string {
     if message.startsWith("Please rate this blog") {
         return review;
     }
+    if message.startsWith("Extract the person") {
+        return personJson;
+    }
+    if message.startsWith("Score the items") {
+        return "{\"math\": 9, \"science\": 8}";
+    }
     if message.startsWith("How would you rate this") {
         return "{\"result\": 4}";
     }
