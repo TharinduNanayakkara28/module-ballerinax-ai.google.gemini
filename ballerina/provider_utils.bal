@@ -258,6 +258,17 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
         return err;
     }
 
+    // Gemini's structured output (`responseSchema`) accepts only a subset of the
+    // OpenAPI 3.0 schema — broadly type, format, description, nullable, enum, items,
+    // properties, required and propertyOrdering. Keywords outside that subset
+    // ($schema/$ref/$defs, title, default, const, additionalProperties, and the
+    // oneOf/allOf combinators) are either rejected or ignored, so
+    // `sanitizeGeminiSchema` strips them before sending. Consequences to be aware of:
+    // a top-level `map<T>` return type is not supported by the schema generator at
+    // all (it errors), and a `map` used as a record field loses its value constraint
+    // once `additionalProperties` is stripped; `$ref`-based nested schemas are not
+    // resolved (they degrade to an unconstrained object); and very large or deeply
+    // nested schemas may still be rejected by the API.
     json sanitizedSchema = sanitizeGeminiSchema(responseSchema.schema);
     GenerateContentRequest request = {
         contents: [{role: GEMINI_ROLE_USER, parts}],

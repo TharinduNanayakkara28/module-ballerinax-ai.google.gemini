@@ -46,3 +46,19 @@ const reviewRecord = {
     rating: 8,
     comment: "Covers warm-up, form, equipment, and nutrition."
 };
+
+type Address record {|
+    string city;
+    string country;
+|};
+
+// A record with a nested record field, for the nested-structured-output test.
+type Person record {|
+    string name;
+    int age;
+    Address address;
+|};
+
+const personJson = "{\"name\": \"Ada\", \"age\": 36, \"address\": {\"city\": \"London\", \"country\": \"UK\"}}";
+
+const personRecord = {name: "Ada", age: 36, address: {city: "London", country: "UK"}};
