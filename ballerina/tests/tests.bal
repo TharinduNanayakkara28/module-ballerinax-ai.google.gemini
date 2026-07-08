@@ -48,6 +48,34 @@ function testChatWithToolCall() returns ai:Error? {
 }
 
 @test:Config
+function testChatWithoutTools() returns ai:Error? {
+    // `tools` defaults to [] when omitted (no tools passed).
+    ai:ChatAssistantMessage result = check provider->chat([{role: ai:USER, content: "Say hello"}]);
+    test:assertEquals(result.content, "Hello there!");
+    test:assertTrue(result.toolCalls is (), "expected no tool calls when no tools are provided");
+}
+
+@test:Config
+function testChatWithMultipleTools() returns ai:Error? {
+    ai:ChatCompletionFunctions weatherTool = {
+        name: "getWeather",
+        description: "Get the weather for a city",
+        parameters: {"type": "object", "properties": {"city": {"type": "string"}}}
+    };
+    ai:ChatCompletionFunctions timeTool = {
+        name: "getTime",
+        description: "Get the current time for a city",
+        parameters: {"type": "object", "properties": {"city": {"type": "string"}}}
+    };
+    ai:ChatAssistantMessage result =
+        check provider->chat([{role: ai:USER, content: "What's the weather using two tools in Colombo?"}],
+            [weatherTool, timeTool]);
+    ai:FunctionCall[]? toolCalls = result.toolCalls;
+    test:assertTrue(toolCalls is ai:FunctionCall[], "expected a tool call in the response");
+    test:assertEquals((<ai:FunctionCall[]>toolCalls)[0].name, "getWeather");
+}
+
+@test:Config
 function testChatWithSystemMessage() returns ai:Error? {
     ai:ChatAssistantMessage result = check provider->chat([
         {role: ai:SYSTEM, content: "You are a helpful assistant."},
@@ -150,6 +178,35 @@ function testGenerateWithInlineImage() returns ai:Error? {
     ai:ImageDocument img = {content: sampleBinaryData, metadata: {mimeType: "image/png"}};
     string description = check provider->generate(`Describe the following image. ${img}.`);
     test:assertEquals(description, "This is a sample image description.");
+}
+
+@test:Config
+function testGenerateWithMultimodalArray() returns ai:Error? {
+    ai:TextDocument text = {content: "Product photo to review"};
+    ai:ImageDocument image = {content: sampleBinaryData, metadata: {mimeType: "image/png"}};
+    ai:Document[] docs = [text, image];
+    string description = check provider->generate(`Describe the following image. ${docs}`);
+    test:assertEquals(description, "This is a sample image description.");
+}
+
+@test:Config
+function testGenerateWithMultipleImagesAndText() returns ai:Error? {
+    ai:ImageDocument png = {content: sampleBinaryData, metadata: {mimeType: "image/png"}};
+    ai:ImageDocument jpeg = {content: sampleBinaryData, metadata: {mimeType: "image/jpeg"}};
+    ai:TextDocument caption = {content: "Compare these product shots"};
+    ai:Document[] docs = [caption, png, jpeg];
+    string description = check provider->generate(`Describe the following image collection. ${docs}`);
+    test:assertEquals(description, "This is a sample image description.");
+}
+
+@test:Config
+function testGenerateWithFileInMultimodalArrayFails() returns ai:Error? {
+    ai:TextDocument text = {content: "Some text"};
+    ai:FileDocument file = {content: "dummy-data"};
+    ai:Document[] docs = [text, file];
+    string|ai:Error result = provider->generate(`Analyze the following documents. ${docs}`);
+    test:assertTrue(result is ai:Error, "expected an error for a file document in a multimodal array");
+    test:assertTrue((<ai:Error>result).message().includes(UNSUPPORTED_DOC_ERROR));
 }
 
 @test:Config
