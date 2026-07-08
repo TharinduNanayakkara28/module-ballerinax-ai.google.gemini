@@ -1,9 +1,0 @@
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/io/ballerina/lib/ai/google/gemini/AiGeminiCodeModifier$AnalysisData.class
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/io/ballerina/lib/ai/google/gemini/GenerateMethodModificationTask$ModifierData.class
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/io/ballerina/lib/ai/google/gemini/GenerateMethodModificationTask.class
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/io/ballerina/lib/ai/google/gemini/TypeMapperImplInitializer.class
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/io/ballerina/lib/ai/google/gemini/GenerateMethodModificationTask$TypeDefinitionModifier.class
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/io/ballerina/lib/ai/google/gemini/AiGeminiCompilerPlugin.class
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/io/ballerina/lib/ai/google/gemini/AiGeminiCodeModifier.class
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/io/ballerina/lib/ai/google/gemini/GenerateMethodModificationTask$GenerateMethodJsonSchemaGenerator.class
-/Users/tharindun/Documents/Backup/Gemina/module-ballerinax-ai.google.gemini/compiler-plugin/build/classes/java/main/module-info.class
