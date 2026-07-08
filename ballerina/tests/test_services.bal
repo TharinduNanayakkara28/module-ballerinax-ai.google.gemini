@@ -26,6 +26,10 @@ service /llm on new http:Listener(8080) {
     resource function post models/[string operation](@http:Payload json payload)
             returns json|error {
         if operation.endsWith(":embedContent") {
+            // Simulate an upstream/runtime failure for a designated input.
+            if embedInputText(payload) == "trigger-runtime-error" {
+                return error("simulated upstream embedding failure");
+            }
             return {embedding: {values: [0.1, 0.2, 0.3]}};
         }
         if operation.endsWith(":batchEmbedContents") {
@@ -139,6 +143,13 @@ isolated function firstPartText(json content) returns json {
         }
     }
     return ();
+}
+
+// Returns the text of the first part of an `:embedContent` request's content.
+isolated function embedInputText(json payload) returns string {
+    map<json> obj = payload is map<json> ? payload : {};
+    json content = obj["content"];
+    return firstPartText(content) is string ? <string>firstPartText(content) : "";
 }
 
 // Returns the request's `generationConfig` object, or `{}` when absent.

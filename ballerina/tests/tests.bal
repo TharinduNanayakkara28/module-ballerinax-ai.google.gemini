@@ -256,3 +256,20 @@ function testEmbedRejectsNonTextChunk() returns ai:Error? {
     ai:Embedding|ai:Error embedding = embeddingProvider->embed(img);
     test:assertTrue(embedding is ai:Error, "expected an error for a non-text chunk");
 }
+
+@test:Config
+function testBatchEmbedRejectsNonTextChunk() returns ai:Error? {
+    ai:TextChunk text = {content: "valid text"};
+    ai:ImageDocument img = {content: sampleBinaryData};
+    ai:Embedding[]|ai:Error embeddings = embeddingProvider->batchEmbed([text, img]);
+    test:assertTrue(embeddings is ai:Error, "expected an error when a non-text chunk is in the batch");
+}
+
+@test:Config
+function testEmbedRuntimeErrorIsWrapped() returns ai:Error? {
+    // The mock returns a 5xx for this input; the provider should wrap it as an ai:Error.
+    ai:TextChunk chunk = {content: "trigger-runtime-error"};
+    ai:Embedding|ai:Error embedding = embeddingProvider->embed(chunk);
+    test:assertTrue(embedding is ai:Error, "expected an error when the embedding call fails");
+    test:assertTrue((<ai:Error>embedding).message().includes("Unable to obtain embedding"));
+}
