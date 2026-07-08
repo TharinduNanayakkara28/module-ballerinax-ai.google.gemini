@@ -1,4 +1,4 @@
-// Copyright (c) 2025 WSO2 LLC (http://www.wso2.com).
+// Copyright (c) 2026 WSO2 LLC (http://www.wso2.com).
 //
 // WSO2 LLC. licenses this file to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file except
@@ -252,10 +252,32 @@ public type UsageMetadata record {
     int totalTokenCount?;
 };
 
+# A safety rating for a single harm category.
+public type SafetyRating record {
+    # Harm category, e.g. "HARM_CATEGORY_HARASSMENT"
+    string category?;
+    # Assessed probability, e.g. "NEGLIGIBLE", "LOW", "MEDIUM", "HIGH"
+    string probability?;
+    # Whether the content was blocked due to this rating
+    boolean blocked?;
+};
+
+# Feedback about the prompt itself, populated when Gemini returns no candidates
+# because the prompt was blocked.
+public type PromptFeedback record {
+    # Reason the prompt was blocked, e.g. "SAFETY", "OTHER", "BLOCKLIST",
+    # "PROHIBITED_CONTENT", "IMAGE_SAFETY"
+    string blockReason?;
+    # Per-category safety ratings for the prompt
+    SafetyRating[] safetyRatings?;
+};
+
 # Response body for `:generateContent`.
 public type GenerateContentResponse record {
     # Generated candidates; multiple only when more than one was requested
     Candidate[] candidates?;
+    # Feedback about the prompt, including a block reason when the prompt is rejected
+    PromptFeedback promptFeedback?;
     # Token accounting for the request
     UsageMetadata usageMetadata?;
     # The concrete model version that served the request

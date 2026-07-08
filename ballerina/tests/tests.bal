@@ -1,4 +1,4 @@
-// Copyright (c) 2025 WSO2 LLC. (http://www.wso2.org).
+// Copyright (c) 2026 WSO2 LLC. (http://www.wso2.org).
 //
 // WSO2 Inc. licenses this file to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file except
@@ -47,6 +47,53 @@ function testChatWithToolCall() returns ai:Error? {
     test:assertEquals((<ai:FunctionCall[]>toolCalls)[0].name, "getWeather");
 }
 
+@test:Config
+function testChatWithSystemMessage() returns ai:Error? {
+    ai:ChatAssistantMessage result = check provider->chat([
+        {role: ai:SYSTEM, content: "You are a helpful assistant."},
+        {role: ai:USER, content: "System check please"}
+    ], []);
+    test:assertEquals(result.content, "System instruction received.");
+}
+
+@test:Config
+function testChatMultiTurnToolConversation() returns ai:Error? {
+    ai:ChatMessage[] messages = [
+        {role: ai:USER, content: "Weather follow-up for Paris"},
+        {role: ai:ASSISTANT, toolCalls: [{name: "getWeather", arguments: {city: "Paris"}}]},
+        {role: "function", name: "getWeather", content: "{\"temperature\": 20}"}
+    ];
+    ai:ChatAssistantMessage result = check provider->chat(messages, []);
+    test:assertEquals(result.content, "It is 20 degrees in Paris.");
+}
+
+@test:Config
+function testChatSanitizesToolSchema() returns ai:Error? {
+    ai:ChatCompletionFunctions tool = {
+        name: "getWeather",
+        description: "Get the weather for a city",
+        parameters: {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "WeatherParams",
+            "$ref": "#/$defs/City",
+            "default": {},
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {"city": {"type": "string", "default": "Colombo"}}
+        }
+    };
+    ai:ChatAssistantMessage result =
+        check provider->chat([{role: ai:USER, content: "Sanitize schema test"}], [tool]);
+    test:assertTrue(result.toolCalls is ai:FunctionCall[], "expected a tool call in the response");
+}
+
+@test:Config
+function testChatWithStopSequence() returns ai:Error? {
+    ai:ChatAssistantMessage result =
+        check provider->chat([{role: ai:USER, content: "Stop test"}], [], "END");
+    test:assertEquals(result.content, "Stopping now.");
+}
+
 // ── generate (structured output) ─────────────────────────────────────────────
 
 @test:Config
@@ -78,6 +125,13 @@ function testGenerateStringReturnType() returns error? {
 }
 
 @test:Config
+function testGenerateForwardsGenerationConfig() returns ai:Error? {
+    // The mock asserts temperature/maxOutputTokens/responseMimeType are present.
+    int result = check provider->generate(`Config check: rate this out of 10`);
+    test:assertEquals(result, 5);
+}
+
+@test:Config
 function testGenerateWithTextDocument() returns ai:Error? {
     ai:TextDocument blog = {content: string `Title: ${blog1.title} Content: ${blog1.content}`};
     int rating = check provider->generate(`How would you rate this blog content out of 10. ${blog}.`);
@@ -96,6 +150,14 @@ function testGenerateWithInlineImage() returns ai:Error? {
     ai:ImageDocument img = {content: sampleBinaryData, metadata: {mimeType: "image/png"}};
     string description = check provider->generate(`Describe the following image. ${img}.`);
     test:assertEquals(description, "This is a sample image description.");
+}
+
+@test:Config
+function testGenerateWithMissingImageMimeFails() returns ai:Error? {
+    ai:ImageDocument img = {content: sampleBinaryData};
+    string|ai:Error description = provider->generate(`Describe the following image. ${img}.`);
+    test:assertTrue(description is ai:Error, "expected an error when the image MIME type is missing");
+    test:assertTrue((<ai:Error>description).message().includes("concrete image MIME type"));
 }
 
 @test:Config

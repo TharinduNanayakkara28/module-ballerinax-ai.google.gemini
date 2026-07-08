@@ -1,4 +1,4 @@
-// Copyright (c) 2025 WSO2 LLC (http://www.wso2.com).
+// Copyright (c) 2026 WSO2 LLC (http://www.wso2.com).
 //
 // WSO2 LLC. licenses this file to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file except
@@ -49,6 +49,9 @@ isolated function generateJsonObjectSchema(map<json> schema) returns ResponseSch
         select [key, value];
 
     updatedSchema["properties"] = {[RESULT]: content};
+    // Mark `result` as required so Gemini must populate it rather than being free
+    // to return an empty object for a non-object return type.
+    updatedSchema["required"] = [RESULT];
 
     return {schema: updatedSchema, isOriginallyJsonObject: false};
 }
@@ -72,8 +75,13 @@ isolated function parseResponseAsType(string resp,
 }
 
 isolated function getExpectedResponseSchema(typedesc<anydata> expectedResponseTypedesc) returns ResponseSchema|ai:Error {
-    // Restricted at compile-time for now.
-    typedesc<json> td = checkpanic expectedResponseTypedesc.ensureType();
+    // The compiler plugin restricts `generate`'s expected type to a `json`-convertible
+    // one today; map the (unexpected) failure to an `ai:Error` rather than panicking.
+    typedesc<json>|error td = expectedResponseTypedesc.ensureType();
+    if td is error {
+        return error ai:Error("Unsupported response type for structured generation; " +
+                "expected a type convertible to 'json'.", td);
+    }
     return generateJsonObjectSchema(check generateJsonSchemaForTypedescAsJson(td));
 }
 
@@ -134,16 +142,22 @@ isolated function addTextPart(string content, Part[] parts) {
 }
 
 # Builds a Gemini `inlineData` image part. Only inline bytes are supported;
-# Gemini does not fetch arbitrary remote URLs for inline data.
+# Gemini does not fetch arbitrary remote URLs for inline data. A concrete IANA
+# image MIME type is required; Gemini rejects a wildcard like `image/*`.
 #
 # + doc - The image document
-# + return - The image part, or an `ai:Error` when a URL is supplied
+# + return - The image part, or an `ai:Error` when a URL is supplied or the
+#            MIME type is missing
 isolated function buildImagePart(ai:ImageDocument doc) returns Part|ai:Error {
     ai:Url|byte[] content = doc.content;
     if content is ai:Url {
         return error ai:Error("Only inline image data ('byte[]') is supported for Gemini; received a URL.");
     }
-    string mimeType = doc.metadata?.mimeType ?: "image/*";
+    string? mimeType = doc.metadata?.mimeType;
+    if mimeType is () {
+        return error ai:Error("A concrete image MIME type (e.g. 'image/png') is required in " +
+                "'metadata.mimeType' for Gemini inline images.");
+    }
     return {inlineData: {mimeType, data: check getBase64EncodedString(content)}};
 }
 
@@ -162,6 +176,38 @@ isolated function handleParseResponseError(error chatResponseError) returns erro
         return error(string `${ERROR_MESSAGE}`, chatResponseError);
     }
     return chatResponseError;
+}
+
+# Builds an error message for a response that carried no candidates. When the
+# prompt was blocked, Gemini populates `promptFeedback.blockReason`; surfacing it
+# makes a blocked prompt distinguishable from a genuinely empty response.
+#
+# + response - The `generateContent` response with empty/absent candidates
+# + return - A message naming the block reason when present, otherwise a generic one
+isolated function buildEmptyCandidatesMessage(GenerateContentResponse response) returns string {
+    PromptFeedback? feedback = response.promptFeedback;
+    if feedback is PromptFeedback {
+        string? blockReason = feedback.blockReason;
+        if blockReason is string {
+            return string `Prompt blocked by the model: ${blockReason}`;
+        }
+    }
+    return "Empty response from the model";
+}
+
+# Returns a parenthetical note naming the candidate's finish reason when
+# generation stopped for a reason other than normal completion ("STOP") — e.g.
+# truncation ("MAX_TOKENS") or safety filtering ("SAFETY"). Helps explain an
+# otherwise cryptic empty/unparseable structured response. Returns "" otherwise.
+#
+# + candidate - The response candidate
+# + return - `" (finishReason: <reason>)"`, or "" for normal completion
+isolated function finishReasonNote(Candidate candidate) returns string {
+    string? finishReason = candidate.finishReason;
+    if finishReason is string && finishReason != "STOP" {
+        return string ` (finishReason: ${finishReason})`;
+    }
+    return "";
 }
 
 # Concatenates the text parts of a response candidate.
@@ -191,11 +237,14 @@ isolated function extractTextFromCandidate(Candidate candidate) returns string? 
 # + httpClient - The provider's HTTP client
 # + apiKey - The Gemini API key, sent as the `x-goog-api-key` header
 # + modelType - The Gemini model to invoke
+# + temperature - The temperature for controlling randomness in the model's output
+# + maxTokens - The upper limit for the number of tokens in the generated response
 # + prompt - The prompt to send
 # + expectedResponseTypedesc - The caller's expected return type
 # + return - The generated value bound to the expected type, or an `ai:Error`
 isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEMINI_MODEL_NAMES modelType,
-        ai:Prompt prompt, typedesc<json> expectedResponseTypedesc) returns anydata|ai:Error {
+        decimal temperature, int maxTokens, ai:Prompt prompt,
+        typedesc<json> expectedResponseTypedesc) returns anydata|ai:Error {
     observe:GenerateContentSpan span = observe:createGenerateContentSpan(modelType);
     span.addProvider("gemini");
 
@@ -213,6 +262,8 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
     GenerateContentRequest request = {
         contents: [{role: GEMINI_ROLE_USER, parts}],
         generationConfig: {
+            temperature,
+            maxOutputTokens: maxTokens,
             responseMimeType: JSON_MIME_TYPE,
             responseSchema: sanitizedSchema is map<json> ? sanitizedSchema : responseSchema.schema
         }
@@ -223,14 +274,14 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
     string path = string `/models/${modelType}:generateContent`;
     GenerateContentResponse|error response = httpClient->post(path, request, headers);
     if response is error {
-        ai:Error err = error("LLM call failed: " + response.message(), detail = response.detail(), cause = response.cause());
+        ai:Error err = error("LLM call failed: " + response.message(), response);
         span.close(err);
         return err;
     }
 
     Candidate[]? candidates = response.candidates;
     if candidates is () || candidates.length() == 0 {
-        ai:Error err = error(NO_RELEVANT_RESPONSE_FROM_THE_LLM);
+        ai:Error err = error(buildEmptyCandidatesMessage(response));
         span.close(err);
         return err;
     }
@@ -249,7 +300,7 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
 
     string? generatedText = extractTextFromCandidate(candidates[0]);
     if generatedText is () {
-        ai:Error err = error(NO_RELEVANT_RESPONSE_FROM_THE_LLM);
+        ai:Error err = error(NO_RELEVANT_RESPONSE_FROM_THE_LLM + finishReasonNote(candidates[0]));
         span.close(err);
         return err;
     }
@@ -258,7 +309,7 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
             responseSchema.isOriginallyJsonObject);
     if res is error {
         ai:Error err = error ai:LlmInvalidGenerationError(string `Invalid value returned from the LLM Client, expected: '${
-            expectedResponseTypedesc.toBalString()}', found '${res.toBalString()}'`);
+            expectedResponseTypedesc.toBalString()}', found '${res.toBalString()}'${finishReasonNote(candidates[0])}`);
         span.close(err);
         return err;
     }
