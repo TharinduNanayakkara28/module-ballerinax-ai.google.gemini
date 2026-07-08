@@ -80,6 +80,15 @@ function validateGenerateContentRequest(string promptText, json payload) {
         test:assertEquals(functionResponse["name"], "getWeather");
     }
 
+    if promptText.startsWith("What's the weather using two tools") {
+        json toolsJson = obj["tools"];
+        test:assertTrue(toolsJson is json[] && toolsJson.length() > 0, "expected a tools array");
+        map<json> firstTool = <map<json>>(<json[]>toolsJson)[0];
+        json declarations = firstTool["functionDeclarations"];
+        test:assertTrue(declarations is json[], "expected function declarations");
+        test:assertEquals((<json[]>declarations).length(), 2, "expected two function declarations");
+    }
+
     if promptText.startsWith("Sanitize schema") {
         map<json> params = toolParameters(obj);
         foreach string key in ["$schema", "title", "$ref", "default", "additionalProperties"] {
