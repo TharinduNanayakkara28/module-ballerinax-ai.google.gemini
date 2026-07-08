@@ -1,4 +1,4 @@
-// Copyright (c) 2025 WSO2 LLC (http://www.wso2.com).
+// Copyright (c) 2026 WSO2 LLC (http://www.wso2.com).
 //
 // WSO2 LLC. licenses this file to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file except
@@ -30,9 +30,26 @@ const API_KEY_HEADER = "x-goog-api-key";
 const GEMINI_ROLE_USER = "user";
 const GEMINI_ROLE_MODEL = "model";
 
-# JSON-schema keywords that the Gemini function-declaration schema does not
-# accept; stripped before sending tool parameters.
-final string[] & readonly UNSUPPORTED_SCHEMA_KEYS = ["$schema", "$id", "$comment", "additionalProperties"];
+# JSON-schema keywords that the Gemini function-declaration / response schema
+# does not accept; stripped before sending tool parameters or a `responseSchema`.
+# Gemini only accepts a subset of OpenAPI 3.0 (type, format, description, nullable,
+# enum, items, properties, required, ...), so metadata keywords, `$ref`/`$defs`
+# indirection, and validation keywords like `default`/`const` are removed. Note
+# that stripping `$ref`/`$defs` drops the reference rather than resolving it, so
+# `$ref`-based (nested-record) tool schemas degrade to an unconstrained object.
+final string[] & readonly UNSUPPORTED_SCHEMA_KEYS = [
+    "$schema",
+    "$id",
+    "$comment",
+    "$anchor",
+    "$ref",
+    "$defs",
+    "definitions",
+    "title",
+    "default",
+    "const",
+    "additionalProperties"
+];
 
 # ModelProvider is a client class that provides an interface for interacting with Gemini Large Language Models.
 public isolated distinct client class ModelProvider {
@@ -89,7 +106,7 @@ public isolated distinct client class ModelProvider {
     # + tools - Tool definitions to be used for the tool call
     # + stop - Stop sequence to stop the completion
     # + return - Function to be called, chat response or an error in-case of failures
-    isolated remote function chat(ai:ChatMessage[]|ai:ChatUserMessage messages, ai:ChatCompletionFunctions[] tools,
+    isolated remote function chat(ai:ChatMessage[]|ai:ChatUserMessage messages, ai:ChatCompletionFunctions[] tools = [],
             string? stop = ()) returns ai:ChatAssistantMessage|ai:Error {
         observe:ChatSpan span = observe:createChatSpan(self.modelName);
         span.addProvider("gemini");
@@ -119,7 +136,7 @@ public isolated distinct client class ModelProvider {
 
         Candidate[]? candidates = response.candidates;
         if candidates is () || candidates.length() == 0 {
-            ai:Error err = error ai:LlmInvalidResponseError("Empty response from the model");
+            ai:Error err = error ai:LlmInvalidResponseError(buildEmptyCandidatesMessage(response));
             span.close(err);
             return err;
         }
@@ -185,7 +202,10 @@ public isolated distinct client class ModelProvider {
                 } else if message is ai:ChatUserMessage {
                     contents.push({role: GEMINI_ROLE_USER, parts: [{text: check getChatMessageStringContent(message.content)}]});
                 } else if message is ai:ChatAssistantMessage {
-                    contents.push(buildAssistantContent(message));
+                    Content? assistantContent = buildAssistantContent(message);
+                    if assistantContent is Content {
+                        contents.push(assistantContent);
+                    }
                 } else if message is ai:ChatFunctionMessage {
                     contents.push(buildFunctionResponseContent(message));
                 }
@@ -254,11 +274,13 @@ isolated function convertCandidateToAssistantMessage(Candidate candidate) return
 }
 
 # Builds a `model`-role content from an assistant message, emitting text and/or
-# `functionCall` parts. Falls back to an empty text part so `parts` is never empty.
+# `functionCall` parts. Returns `()` when the message carries neither content nor
+# tool calls, so the caller can omit it rather than send an empty (or empty-text)
+# part, which Gemini rejects.
 #
 # + message - The assistant message to convert
-# + return - The corresponding Gemini content
-isolated function buildAssistantContent(ai:ChatAssistantMessage message) returns Content {
+# + return - The corresponding Gemini content, or `()` when there is nothing to send
+isolated function buildAssistantContent(ai:ChatAssistantMessage message) returns Content? {
     Part[] parts = [];
     string? content = message?.content;
     if content is string && content.length() > 0 {
@@ -271,14 +293,16 @@ isolated function buildAssistantContent(ai:ChatAssistantMessage message) returns
         }
     }
     if parts.length() == 0 {
-        parts.push({text: ""});
+        return ();
     }
     return {role: GEMINI_ROLE_MODEL, parts};
 }
 
-# Builds a `functionResponse` content (sent with the `user` role, the only role
-# Gemini accepts besides `model`) from a tool-result message. The result string is
-# parsed as a JSON object when possible, otherwise wrapped as `{"result": <text>}`.
+# Builds a `functionResponse` content from a tool-result message. It is sent with
+# the `user` role: the Gemini v1beta `Content.role` field accepts only `user` and
+# `model` (not `function`), so tool results are attributed to `user`. This choice
+# is locked by `testChatMultiTurnToolConversation`. The result string is parsed as
+# a JSON object when possible, otherwise wrapped as `{"result": <text>}`.
 #
 # + message - The function/tool result message
 # + return - The corresponding Gemini content
