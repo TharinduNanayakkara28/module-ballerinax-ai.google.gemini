@@ -19,8 +19,10 @@ import ballerina/test;
 
 const SERVICE_URL = "http://localhost:8080/llm";
 const API_KEY = "not-a-real-api-key";
-const INLINE_IMAGE_ONLY_ERROR = "Only inline image data";
-const UNSUPPORTED_DOC_ERROR = "Only text and image documents are supported.";
+const UNSUPPORTED_DOC_ERROR = "Only text, image and file documents are supported.";
+// Served by the mock asset endpoint so the URL-download path can be exercised.
+const IMAGE_URL = "http://localhost:8080/llm/assets/sample.png";
+const PDF_URL = "http://localhost:8080/llm/assets/sample.pdf";
 
 final ModelProvider provider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL);
 final EmbeddingProvider embeddingProvider = check new (API_KEY, GEMINI_EMBEDDING_001, SERVICE_URL);
@@ -215,13 +217,43 @@ function testGenerateWithMultipleImagesAndText() returns ai:Error? {
 }
 
 @test:Config
-function testGenerateWithFileInMultimodalArrayFails() returns ai:Error? {
+function testGenerateWithUnsupportedDocInMultimodalArrayFails() returns ai:Error? {
     ai:TextDocument text = {content: "Some text"};
-    ai:FileDocument file = {content: "dummy-data"};
-    ai:Document[] docs = [text, file];
+    ai:AudioDocument audio = {content: sampleBinaryData};
+    ai:Document[] docs = [text, audio];
     string|ai:Error result = provider->generate(`Analyze the following documents. ${docs}`);
-    test:assertTrue(result is ai:Error, "expected an error for a file document in a multimodal array");
+    test:assertTrue(result is ai:Error, "expected an error for an unsupported document in a multimodal array");
     test:assertTrue((<ai:Error>result).message().includes(UNSUPPORTED_DOC_ERROR));
+}
+
+@test:Config
+function testGenerateWithImageUrl() returns ai:Error? {
+    // No metadata.mimeType: the connector downloads the bytes and uses the
+    // response Content-Type (image/png).
+    ai:ImageDocument img = {content: IMAGE_URL};
+    string description = check provider->generate(`Describe the image at the URL. ${img}.`);
+    test:assertEquals(description, "This is a sample image description.");
+}
+
+@test:Config
+function testGenerateWithPdfBytes() returns ai:Error? {
+    ai:FileDocument pdf = {content: sampleBinaryData, metadata: {mimeType: "application/pdf"}};
+    string summary = check provider->generate(`Summarize the PDF bytes. ${pdf}.`);
+    test:assertEquals(summary, "This is a sample document summary.");
+}
+
+@test:Config
+function testGenerateWithPdfUrl() returns ai:Error? {
+    ai:FileDocument pdf = {content: PDF_URL};
+    string summary = check provider->generate(`Summarize the PDF at the URL. ${pdf}.`);
+    test:assertEquals(summary, "This is a sample document summary.");
+}
+
+@test:Config
+function testGenerateWithFileId() returns ai:Error? {
+    ai:FileDocument file = {content: {fileId: "files/abc-123"}};
+    string summary = check provider->generate(`Summarize the referenced file. ${file}.`);
+    test:assertEquals(summary, "This is a sample document summary.");
 }
 
 @test:Config
@@ -233,16 +265,8 @@ function testGenerateWithMissingImageMimeFails() returns ai:Error? {
 }
 
 @test:Config
-function testGenerateWithImageUrlFails() returns ai:Error? {
-    ai:ImageDocument img = {content: "https://example.com/image.jpg", metadata: {mimeType: "image/jpg"}};
-    string|ai:Error description = provider->generate(`Describe the following image. ${img}.`);
-    test:assertTrue(description is ai:Error, "expected an error for a URL image");
-    test:assertTrue((<ai:Error>description).message().includes(INLINE_IMAGE_ONLY_ERROR));
-}
-
-@test:Config
 function testGenerateWithUnsupportedDocument() returns ai:Error? {
-    ai:FileDocument doc = {content: "dummy-data"};
+    ai:AudioDocument doc = {content: sampleBinaryData};
     string|error result = provider->generate(`What is in this document. ${doc}.`);
     test:assertTrue(result is error, "expected an error for an unsupported document");
     test:assertTrue((<error>result).message().includes(UNSUPPORTED_DOC_ERROR));

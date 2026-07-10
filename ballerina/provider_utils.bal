@@ -131,8 +131,46 @@ isolated function addDocumentPart(ai:Document|ai:Chunk doc, Part[] parts) return
     } else if doc is ai:ImageDocument {
         parts.push(check buildImagePart(doc));
         return;
+    } else if doc is ai:FileDocument {
+        parts.push(check buildFilePart(doc));
+        return;
     }
-    return error ai:Error("Only text and image documents are supported.");
+    return error ai:Error("Only text, image and file documents are supported.");
+}
+
+# Builds a Gemini part from an `ai:FileDocument` (e.g. a PDF). Inline bytes and
+# downloaded URL content are sent as `inlineData`; an `ai:FileId` (a Gemini File
+# API URI) is sent as `fileData`. A concrete MIME type is required for inline/
+# downloaded bytes — from `metadata.mimeType`, falling back to the URL response's
+# `Content-Type` for URLs.
+#
+# + doc - The file document
+# + return - The corresponding part, or an `ai:Error` on failure
+isolated function buildFilePart(ai:FileDocument doc) returns Part|ai:Error {
+    byte[]|ai:Url|ai:FileId content = doc.content;
+    if content is ai:FileId {
+        FileData fileData = {fileUri: content.fileId};
+        string? mimeType = doc.metadata?.mimeType;
+        if mimeType is string {
+            fileData.mimeType = mimeType;
+        }
+        return {fileData};
+    }
+    if content is ai:Url {
+        [byte[], string?] downloaded = check downloadDocument(content);
+        string? mimeType = doc.metadata?.mimeType ?: downloaded[1];
+        if mimeType is () {
+            return error ai:Error("A concrete file MIME type is required for Gemini; none was provided in " +
+                    "'metadata.mimeType' and the URL response had no usable 'Content-Type'.");
+        }
+        return {inlineData: {mimeType, data: check getBase64EncodedString(downloaded[0])}};
+    }
+    string? mimeType = doc.metadata?.mimeType;
+    if mimeType is () {
+        return error ai:Error("A concrete file MIME type (e.g. 'application/pdf') is required in " +
+                "'metadata.mimeType' for Gemini inline files.");
+    }
+    return {inlineData: {mimeType, data: check getBase64EncodedString(content)}};
 }
 
 isolated function addTextPart(string content, Part[] parts) {
@@ -141,17 +179,25 @@ isolated function addTextPart(string content, Part[] parts) {
     }
 }
 
-# Builds a Gemini `inlineData` image part. Only inline bytes are supported;
-# Gemini does not fetch arbitrary remote URLs for inline data. A concrete IANA
-# image MIME type is required; Gemini rejects a wildcard like `image/*`.
+# Builds a Gemini `inlineData` image part. Inline bytes are sent as-is; a URL is
+# downloaded by the connector (Gemini does not fetch arbitrary web URLs) and sent
+# inline. A concrete IANA image MIME type is required — from `metadata.mimeType`,
+# falling back to the URL response's `Content-Type` — since Gemini rejects a
+# wildcard like `image/*`.
 #
 # + doc - The image document
-# + return - The image part, or an `ai:Error` when a URL is supplied or the
-#            MIME type is missing
+# + return - The image part, or an `ai:Error` when the MIME type cannot be
+#            determined or the download fails
 isolated function buildImagePart(ai:ImageDocument doc) returns Part|ai:Error {
     ai:Url|byte[] content = doc.content;
     if content is ai:Url {
-        return error ai:Error("Only inline image data ('byte[]') is supported for Gemini; received a URL.");
+        [byte[], string?] downloaded = check downloadDocument(content);
+        string? mimeType = doc.metadata?.mimeType ?: downloaded[1];
+        if mimeType is () {
+            return error ai:Error("A concrete image MIME type is required for Gemini; none was provided in " +
+                    "'metadata.mimeType' and the URL response had no usable 'Content-Type'.");
+        }
+        return {inlineData: {mimeType, data: check getBase64EncodedString(downloaded[0])}};
     }
     string? mimeType = doc.metadata?.mimeType;
     if mimeType is () {
@@ -159,6 +205,67 @@ isolated function buildImagePart(ai:ImageDocument doc) returns Part|ai:Error {
                 "'metadata.mimeType' for Gemini inline images.");
     }
     return {inlineData: {mimeType, data: check getBase64EncodedString(content)}};
+}
+
+# Downloads the bytes at `url` and returns them together with the response MIME
+# type. Gemini cannot fetch arbitrary web URLs itself, so image/file URLs are
+# fetched by the connector and sent inline. Redirects are followed.
+#
+# + url - The URL to fetch
+# + return - The downloaded bytes and the response MIME type (`Content-Type`
+#            without parameters, `()` when absent), or an `ai:Error` on failure
+isolated function downloadDocument(ai:Url url) returns [byte[], string?]|ai:Error {
+    [string, string] originPath = check splitUrl(url);
+    http:Client|error downloadClient = new (originPath[0], {followRedirects: {enabled: true, maxCount: 5}});
+    if downloadClient is error {
+        return error ai:Error(string `Failed to create a client to download the document from '${url}'.`, downloadClient);
+    }
+    http:Response|error response = downloadClient->get(originPath[1]);
+    if response is error {
+        return error ai:Error(string `Failed to download the document from '${url}'.`, response);
+    }
+    if response.statusCode < 200 || response.statusCode >= 300 {
+        return error ai:Error(string `Failed to download the document from '${url}': status ${response.statusCode}.`);
+    }
+    byte[]|error payload = response.getBinaryPayload();
+    if payload is error {
+        return error ai:Error(string `Failed to read the downloaded document from '${url}'.`, payload);
+    }
+    return [payload, normalizeMimeType(response.getContentType())];
+}
+
+# Splits a URL into its origin (`scheme://host[:port]`) and the resource path
+# (path + query), for constructing an `http:Client`.
+#
+# + url - The URL to split
+# + return - `[origin, path]`, or an `ai:Error` when the URL has no scheme
+isolated function splitUrl(ai:Url url) returns [string, string]|ai:Error {
+    string urlStr = url;
+    int? schemeIdx = urlStr.indexOf("://");
+    if schemeIdx is () {
+        return error ai:Error(string `Invalid URL (missing scheme): '${url}'.`);
+    }
+    int hostStart = schemeIdx + 3;
+    string afterScheme = urlStr.substring(hostStart);
+    int? slashIdx = afterScheme.indexOf("/");
+    if slashIdx is () {
+        return [urlStr, "/"];
+    }
+    return [urlStr.substring(0, hostStart + slashIdx), afterScheme.substring(slashIdx)];
+}
+
+# Strips any parameters from a `Content-Type` value (e.g. "; charset=..."),
+# returning the bare MIME type, or `()` when empty.
+#
+# + contentType - The raw `Content-Type` header value
+# + return - The bare MIME type, or `()` when there is none
+isolated function normalizeMimeType(string contentType) returns string? {
+    if contentType.length() == 0 {
+        return ();
+    }
+    int? semicolon = contentType.indexOf(";");
+    string mime = (semicolon is int ? contentType.substring(0, semicolon) : contentType).trim();
+    return mime.length() > 0 ? mime : ();
 }
 
 isolated function getBase64EncodedString(byte[] content) returns string|ai:Error {
