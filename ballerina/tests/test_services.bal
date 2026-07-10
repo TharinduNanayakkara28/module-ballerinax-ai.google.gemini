@@ -50,6 +50,15 @@ service /llm on new http:Listener(8080) {
         }
         return buildTextResponse(getMockResultText(promptText));
     }
+
+    // Serves document bytes so the connector's URL-download path can be exercised.
+    // `.pdf` names are served as application/pdf; everything else as image/png.
+    resource function get assets/[string name]() returns http:Response {
+        http:Response response = new;
+        string mimeType = name.endsWith(".pdf") ? "application/pdf" : "image/png";
+        response.setBinaryPayload(sampleBinaryData, mimeType);
+        return response;
+    }
 }
 
 // Asserts the shape of a `:generateContent` request for the scenarios that
@@ -116,6 +125,46 @@ function validateGenerateContentRequest(string promptText, json payload) {
         test:assertEquals(genConfig["maxOutputTokens"], 512, "maxTokens must be forwarded to generate()");
         test:assertEquals(genConfig["responseMimeType"], "application/json");
     }
+
+    if promptText.startsWith("Describe the image at the URL") {
+        map<json> inlineData = inlineDataPart(obj);
+        test:assertEquals(inlineData["mimeType"], "image/png", "downloaded image URL must become an inlineData part");
+        test:assertTrue(inlineData["data"] is string, "expected base64 data for the downloaded image");
+    }
+
+    if promptText.startsWith("Summarize the PDF") {
+        map<json> inlineData = inlineDataPart(obj);
+        test:assertEquals(inlineData["mimeType"], "application/pdf", "PDF must become an application/pdf inlineData part");
+    }
+
+    if promptText.startsWith("Summarize the referenced file") {
+        map<json> part = partWithKey(obj, "fileData");
+        map<json> fileData = part["fileData"] is map<json> ? <map<json>>part["fileData"] : {};
+        test:assertEquals(fileData["fileUri"], "files/abc-123", "a FileId must become a fileData part");
+    }
+}
+
+// Returns the `inlineData` object of the first inlineData part in `contents[0]`.
+isolated function inlineDataPart(map<json> payload) returns map<json> {
+    map<json> part = partWithKey(payload, "inlineData");
+    return part["inlineData"] is map<json> ? <map<json>>part["inlineData"] : {};
+}
+
+// Returns the first part of `contents[0]` that carries `key`, or `{}` when none.
+isolated function partWithKey(map<json> payload, string key) returns map<json> {
+    json contents = payload["contents"];
+    if contents is json[] && contents.length() > 0 {
+        map<json> first = contents[0] is map<json> ? <map<json>>contents[0] : {};
+        json parts = first["parts"];
+        if parts is json[] {
+            foreach json part in parts {
+                if part is map<json> && part.hasKey(key) {
+                    return part;
+                }
+            }
+        }
+    }
+    return {};
 }
 
 // Returns the first text part of `contents[0]`, or "" when absent.
@@ -208,8 +257,11 @@ isolated function getMockResultText(string message) returns string {
     if message.startsWith("How would you rate this") {
         return "{\"result\": 4}";
     }
-    if message.startsWith("Describe the following image") {
+    if message.startsWith("Describe the following image") || message.startsWith("Describe the image at the URL") {
         return "{\"result\": \"This is a sample image description.\"}";
+    }
+    if message.startsWith("Summarize the") {
+        return "{\"result\": \"This is a sample document summary.\"}";
     }
     if message.startsWith("Give me a random joke") {
         return "{\"result\": \"Why did the chicken cross the road?\"}";

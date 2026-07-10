@@ -119,6 +119,18 @@ public type InlineData record {
     string data;
 };
 
+# A reference to a file the model should read, by URI. Used for content already
+# uploaded via the Gemini File API (the URI returned by the upload). Gemini does
+# not fetch arbitrary web URLs here, so ordinary image/document URLs are downloaded
+# by the connector and sent as `InlineData` instead.
+public type FileData record {
+    # IANA media type of the referenced file, e.g. "application/pdf". Optional;
+    # Gemini can infer it for File API URIs
+    string mimeType?;
+    # URI of the file, e.g. a Gemini File API URI
+    string fileUri;
+};
+
 # A function call requested by the model within a candidate part.
 public type FunctionCall record {
     # Name of the function the model intends to call
@@ -140,8 +152,10 @@ public type FunctionResponse record {
 public type Part record {
     # Plain text content
     string text?;
-    # Inline binary data (e.g. an image)
+    # Inline binary data (e.g. an image or PDF)
     InlineData inlineData?;
+    # A reference to a file by URI (e.g. a Gemini File API URI)
+    FileData fileData?;
     # A function call requested by the model
     FunctionCall functionCall?;
     # A tool result supplied back to the model
