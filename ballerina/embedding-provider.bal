@@ -94,6 +94,11 @@ public distinct isolated client class EmbeddingProvider {
             span.close(err);
             return err;
         }
+        // Gemini rejects an empty `requests` array with a 400, so short-circuit.
+        if chunks.length() == 0 {
+            span.close();
+            return [];
+        }
         do {
             string[] input = chunks.map(chunk => chunk.content.toString());
             EmbedContentRequest[] requests = [];
@@ -108,6 +113,15 @@ public distinct isolated client class EmbeddingProvider {
             map<string|string[]> headers = {[API_KEY_HEADER]: self.apiKey};
             string path = string `/models/${self.modelType}:batchEmbedContents`;
             BatchEmbedContentsResponse response = check self.httpClient->post(path, request, headers);
+
+            // The contract is one embedding per input chunk, in order. A short or
+            // partial response would silently misalign every downstream vector with
+            // the wrong chunk, corrupting a vector store in a way that is very hard
+            // to diagnose later, so fail loudly instead.
+            if response.embeddings.length() != chunks.length() {
+                return error ai:Error(string `Expected ${chunks.length()} embeddings from the model but received ${
+                    response.embeddings.length()}`);
+            }
 
             ai:Embedding[] embeddings = [];
             foreach ContentEmbedding contentEmbedding in response.embeddings {

@@ -247,11 +247,23 @@ isolated function splitUrl(ai:Url url) returns [string, string]|ai:Error {
     }
     int hostStart = schemeIdx + 3;
     string afterScheme = urlStr.substring(hostStart);
-    int? slashIdx = afterScheme.indexOf("/");
-    if slashIdx is () {
-        return [urlStr, "/"];
+    // The authority ends at the first '/', '?' or '#'. Splitting on '/' alone is wrong
+    // for a URL with no path — "https://host?q=1" would put the query string into the
+    // client's target URL and leave the request path as "/".
+    int authorityEnd = afterScheme.length();
+    foreach string delimiter in ["/", "?", "#"] {
+        int? idx = afterScheme.indexOf(delimiter);
+        if idx is int && idx < authorityEnd {
+            authorityEnd = idx;
+        }
     }
-    return [urlStr.substring(0, hostStart + slashIdx), afterScheme.substring(slashIdx)];
+    string origin = urlStr.substring(0, hostStart + authorityEnd);
+    string remainder = afterScheme.substring(authorityEnd);
+    if remainder.length() == 0 {
+        return [origin, "/"];
+    }
+    // A query or fragment with no path still needs a leading '/' in the request target.
+    return [origin, remainder.startsWith("/") ? remainder : "/" + remainder];
 }
 
 # Strips any parameters from a `Content-Type` value (e.g. "; charset=..."),
@@ -285,6 +297,58 @@ isolated function handleParseResponseError(error chatResponseError) returns erro
     return chatResponseError;
 }
 
+# Maps an HTTP failure from a Gemini call onto the `ai:LlmError` taxonomy.
+#
+# Gemini reports failures as `{"error": {"code": .., "message": "..", "status": ".."}}`.
+# `http:ClientRequestError` (4xx) and `http:RemoteServerError` (5xx) carry that body in
+# their detail, so the status code and the API's own message are surfaced rather than
+# discarded. `ai:LlmConnectionError` is reserved for genuine transport failures — a 400
+# `INVALID_ARGUMENT`, a 401 bad key and a 429 `RESOURCE_EXHAUSTED` are not connection
+# problems, and reporting them as such sends callers down the wrong diagnostic path.
+#
+# + err - The error returned by the HTTP client
+# + return - A typed `ai:Error` describing the failure
+isolated function mapHttpError(error err) returns ai:Error {
+    int statusCode;
+    anydata body;
+    if err is http:ClientRequestError {
+        statusCode = err.detail().statusCode;
+        body = err.detail().body;
+    } else if err is http:RemoteServerError {
+        statusCode = err.detail().statusCode;
+        body = err.detail().body;
+    } else {
+        return error ai:LlmConnectionError("Error while connecting to the model", err);
+    }
+    string detail = describeGeminiError(body);
+    return error ai:LlmError(detail.length() > 0
+            ? string `Gemini API request failed with status ${statusCode}: ${detail}`
+            : string `Gemini API request failed with status ${statusCode}`, err);
+}
+
+# Extracts `error.status` and `error.message` from Gemini's error envelope.
+#
+# + body - The response body carried by the HTTP error
+# + return - A "STATUS - message" description, or "" when the envelope is absent
+isolated function describeGeminiError(anydata body) returns string {
+    json payload = body.toJson();
+    if payload !is map<json> {
+        return "";
+    }
+    json errorObj = payload["error"];
+    if errorObj !is map<json> {
+        return "";
+    }
+    json status = errorObj["status"];
+    json message = errorObj["message"];
+    string statusText = status is string ? status : "";
+    string messageText = message is string ? message : "";
+    if statusText.length() > 0 && messageText.length() > 0 {
+        return string `${statusText} - ${messageText}`;
+    }
+    return messageText.length() > 0 ? messageText : statusText;
+}
+
 # Builds an error message for a response that carried no candidates. When the
 # prompt was blocked, Gemini populates `promptFeedback.blockReason`; surfacing it
 # makes a blocked prompt distinguishable from a genuinely empty response.
@@ -302,19 +366,58 @@ isolated function buildEmptyCandidatesMessage(GenerateContentResponse response) 
     return "Empty response from the model";
 }
 
-# Returns a parenthetical note naming the candidate's finish reason when
-# generation stopped for a reason other than normal completion ("STOP") — e.g.
-# truncation ("MAX_TOKENS") or safety filtering ("SAFETY"). Helps explain an
-# otherwise cryptic empty/unparseable structured response. Returns "" otherwise.
+# Returns the candidate's finish reason when generation stopped for a reason other
+# than normal completion ("STOP") — e.g. truncation ("MAX_TOKENS"), safety filtering
+# ("SAFETY"), recitation ("RECITATION") or a malformed tool call
+# ("MALFORMED_FUNCTION_CALL").
+#
+# + candidate - The response candidate
+# + return - The finish reason, or `()` when generation completed normally
+isolated function abnormalFinishReason(Candidate candidate) returns string? {
+    string? finishReason = candidate.finishReason;
+    if finishReason is string && finishReason != "STOP" {
+        return finishReason;
+    }
+    return ();
+}
+
+# Formats the abnormal finish reason as a parenthetical suffix for an error message.
 #
 # + candidate - The response candidate
 # + return - `" (finishReason: <reason>)"`, or "" for normal completion
 isolated function finishReasonNote(Candidate candidate) returns string {
-    string? finishReason = candidate.finishReason;
-    if finishReason is string && finishReason != "STOP" {
-        return string ` (finishReason: ${finishReason})`;
+    string? finishReason = abnormalFinishReason(candidate);
+    return finishReason is string ? string ` (finishReason: ${finishReason})` : "";
+}
+
+# Builds an error message for a candidate that produced neither text nor a function
+# call. Without this, such a candidate becomes a valid-looking `ai:ChatAssistantMessage`
+# with `content` and `toolCalls` both `()`, which surfaces inside an agent loop as an
+# inscrutable downstream failure rather than an actionable error.
+#
+# + candidate - The response candidate that yielded no usable content
+# + response - The full response, consulted for `promptFeedback.blockReason`
+# + return - A message naming the finish reason and block reason where available
+isolated function buildUnusableCandidateMessage(Candidate candidate,
+        GenerateContentResponse response) returns string {
+    string message = "The model returned no usable content";
+    string? finishReason = abnormalFinishReason(candidate);
+    if finishReason is string {
+        message += string ` (finishReason: ${finishReason})`;
+        if finishReason == "MAX_TOKENS" {
+            message += "; generation was truncated before any text was produced. Thinking " +
+                "tokens count towards 'maxTokens', so raising 'maxTokens' or lowering " +
+                "'thinkingBudget' may resolve this";
+        }
     }
-    return "";
+    PromptFeedback? feedback = response.promptFeedback;
+    if feedback is PromptFeedback {
+        string? blockReason = feedback.blockReason;
+        if blockReason is string {
+            message += string `; prompt blocked by the model: ${blockReason}`;
+        }
+    }
+    return message;
 }
 
 # Concatenates the text parts of a response candidate.
@@ -344,13 +447,15 @@ isolated function extractTextFromCandidate(Candidate candidate) returns string? 
 # + httpClient - The provider's HTTP client
 # + apiKey - The Gemini API key, sent as the `x-goog-api-key` header
 # + modelType - The Gemini model to invoke
-# + temperature - The temperature for controlling randomness in the model's output
+# + temperature - The temperature for controlling randomness in the model's output; omitted
+#                 from the request when `()` so the model's own default applies
 # + maxTokens - The upper limit for the number of tokens in the generated response
+# + thinkingBudget - Token budget for internal reasoning; omitted when `()`
 # + prompt - The prompt to send
 # + expectedResponseTypedesc - The caller's expected return type
 # + return - The generated value bound to the expected type, or an `ai:Error`
 isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEMINI_MODEL_NAMES modelType,
-        decimal temperature, int maxTokens, ai:Prompt prompt,
+        decimal? temperature, int maxTokens, int? thinkingBudget, ai:Prompt prompt,
         typedesc<json> expectedResponseTypedesc) returns anydata|ai:Error {
     observe:GenerateContentSpan span = observe:createGenerateContentSpan(modelType);
     span.addProvider("gemini");
@@ -376,15 +481,21 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
     // once `additionalProperties` is stripped; `$ref`-based nested schemas are not
     // resolved (they degrade to an unconstrained object); and very large or deeply
     // nested schemas may still be rejected by the API.
-    json sanitizedSchema = sanitizeGeminiSchema(responseSchema.schema);
+    map<json> sanitizedSchema = sanitizeGeminiObjectSchema(responseSchema.schema);
+    GenerationConfig generationConfig = {
+        maxOutputTokens: maxTokens,
+        responseMimeType: JSON_MIME_TYPE,
+        responseSchema: sanitizedSchema
+    };
+    if temperature is decimal {
+        generationConfig.temperature = temperature;
+    }
+    if thinkingBudget is int {
+        generationConfig.thinkingConfig = {thinkingBudget};
+    }
     GenerateContentRequest request = {
         contents: [{role: GEMINI_ROLE_USER, parts}],
-        generationConfig: {
-            temperature,
-            maxOutputTokens: maxTokens,
-            responseMimeType: JSON_MIME_TYPE,
-            responseSchema: sanitizedSchema is map<json> ? sanitizedSchema : responseSchema.schema
-        }
+        generationConfig
     };
     span.addInputMessages(request.contents.toJson());
 
@@ -392,14 +503,14 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
     string path = string `/models/${modelType}:generateContent`;
     GenerateContentResponse|error response = httpClient->post(path, request, headers);
     if response is error {
-        ai:Error err = error("LLM call failed: " + response.message(), response);
+        ai:Error err = mapHttpError(response);
         span.close(err);
         return err;
     }
 
     Candidate[]? candidates = response.candidates;
     if candidates is () || candidates.length() == 0 {
-        ai:Error err = error(buildEmptyCandidatesMessage(response));
+        ai:Error err = error ai:LlmInvalidResponseError(buildEmptyCandidatesMessage(response));
         span.close(err);
         return err;
     }
@@ -418,7 +529,8 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
 
     string? generatedText = extractTextFromCandidate(candidates[0]);
     if generatedText is () {
-        ai:Error err = error(NO_RELEVANT_RESPONSE_FROM_THE_LLM + finishReasonNote(candidates[0]));
+        ai:Error err = error ai:LlmInvalidResponseError(
+                NO_RELEVANT_RESPONSE_FROM_THE_LLM + finishReasonNote(candidates[0]));
         span.close(err);
         return err;
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, WSO2 LLC. (https://www.wso2.com).
+ * Copyright (c) 2026 WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -35,9 +35,10 @@ public class Generator {
                 new Module("ballerinax", "ai.google.gemini", "1"), "generateLlmResponse", null,
                 modelProvider.get(StringUtils.fromString("httpClient")),
                 modelProvider.get(StringUtils.fromString("apiKey")),
-                modelProvider.get(StringUtils.fromString("modelName")),
+                modelProvider.get(StringUtils.fromString("modelType")),
                 modelProvider.get(StringUtils.fromString("temperature")),
                 modelProvider.get(StringUtils.fromString("maxTokens")),
+                modelProvider.get(StringUtils.fromString("thinkingBudget")),
                 prompt, expectedResponseTypedesc);
     }
 }

@@ -1,6 +1,6 @@
-// Copyright (c) 2026 WSO2 LLC. (http://www.wso2.org).
+// Copyright (c) 2026 WSO2 LLC (http://www.wso2.com).
 //
-// WSO2 Inc. licenses this file to you under the Apache License,
+// WSO2 LLC. licenses this file to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,7 +24,7 @@ import ballerina/test;
 // layer unique to Gemini is covered.
 service /llm on new http:Listener(8080) {
     resource function post models/[string operation](@http:Payload json payload)
-            returns json|error {
+            returns json|http:Response|error {
         if operation.endsWith(":embedContent") {
             // Simulate an upstream/runtime failure for a designated input.
             if embedInputText(payload) == "trigger-runtime-error" {
@@ -47,6 +47,32 @@ service /llm on new http:Listener(8080) {
         }
         if promptText.startsWith("Sanitize schema") {
             return buildToolCallResponse("getWeather", {city: "Paris"});
+        }
+        // A truncated candidate: thinking consumed the whole token budget, so the
+        // candidate carries a finishReason but no parts.
+        if promptText.startsWith("Truncated by thinking") {
+            return {candidates: [{content: {role: "model", parts: []}, finishReason: "MAX_TOKENS"}]};
+        }
+        // A safety-filtered candidate: no content at all, only a finishReason.
+        if promptText.startsWith("Safety filtered") {
+            return {candidates: [{finishReason: "SAFETY"}]};
+        }
+        // A blocked prompt: Gemini returns no candidates, only promptFeedback.
+        if promptText.startsWith("Blocked prompt") {
+            return {candidates: [], promptFeedback: {blockReason: "PROHIBITED_CONTENT"}};
+        }
+        // A 4xx carrying Gemini's error envelope, so the error-mapping path is covered.
+        if promptText.startsWith("Trigger API error") {
+            http:Response errorResponse = new;
+            errorResponse.statusCode = 400;
+            errorResponse.setJsonPayload({
+                'error: {
+                    code: 400,
+                    message: "Invalid JSON payload received.",
+                    status: "INVALID_ARGUMENT"
+                }
+            });
+            return errorResponse;
         }
         return buildTextResponse(getMockResultText(promptText));
     }
@@ -114,6 +140,24 @@ function validateGenerateContentRequest(string promptText, json payload) {
         test:assertEquals(city["type"], "string");
     }
 
+    if promptText.startsWith("Array tool result") {
+        // The functionResponse must carry the parsed array, not the raw string.
+        map<json> fnResponse = functionResponsePayload(obj);
+        test:assertEquals(fnResponse["result"], <json[]>[1, 2, 3],
+                "a JSON array tool result must stay structured, not become a string");
+    }
+
+    if promptText.startsWith("Multi system") {
+        map<json> sysInstruction = obj["systemInstruction"] is map<json>
+            ? <map<json>>obj["systemInstruction"] : {};
+        json[] parts = sysInstruction["parts"] is json[] ? <json[]>sysInstruction["parts"] : [];
+        test:assertEquals(parts.length(), 2, "each system message becomes its own part");
+        map<json> second = parts[1] is map<json> ? <map<json>>parts[1] : {};
+        test:assertTrue((second["text"] is string ? <string>second["text"] : "").startsWith("\n"),
+                "successive system instructions must be newline-separated, since Gemini " +
+                "concatenates parts with no separator");
+    }
+
     if promptText.startsWith("Stop test") {
         map<json> genConfig = generationConfig(obj);
         test:assertEquals(genConfig["stopSequences"], <json[]>["END"]);
@@ -121,8 +165,14 @@ function validateGenerateContentRequest(string promptText, json payload) {
 
     if promptText.startsWith("Config check") {
         map<json> genConfig = generationConfig(obj);
-        test:assertEquals(genConfig["temperature"], 0.7d, "temperature must be forwarded to generate()");
-        test:assertEquals(genConfig["maxOutputTokens"], 512, "maxTokens must be forwarded to generate()");
+        // `temperature` is omitted unless the caller sets it, so the model's own default
+        // applies. Google strongly recommends leaving it unset on Gemini 3 models.
+        test:assertFalse(genConfig.hasKey("temperature"),
+                "temperature must be omitted from generate() when unset");
+        test:assertFalse(genConfig.hasKey("thinkingConfig"),
+                "thinkingConfig must be omitted from generate() when thinkingBudget is unset");
+        test:assertEquals(genConfig["maxOutputTokens"], DEFAULT_MAX_TOKEN_COUNT,
+                "maxTokens must be forwarded to generate()");
         test:assertEquals(genConfig["responseMimeType"], "application/json");
     }
 
@@ -148,6 +198,31 @@ function validateGenerateContentRequest(string promptText, json payload) {
 isolated function inlineDataPart(map<json> payload) returns map<json> {
     map<json> part = partWithKey(payload, "inlineData");
     return part["inlineData"] is map<json> ? <map<json>>part["inlineData"] : {};
+}
+
+// Returns the `response` object of the first `functionResponse` part found anywhere in
+// `contents`, or `{}` when none. Unlike `partWithKey` this scans every content entry,
+// since a tool result is never the first turn.
+isolated function functionResponsePayload(map<json> payload) returns map<json> {
+    json contents = payload["contents"];
+    if contents !is json[] {
+        return {};
+    }
+    foreach json content in contents {
+        map<json> entry = content is map<json> ? <map<json>>content : {};
+        json parts = entry["parts"];
+        if parts !is json[] {
+            continue;
+        }
+        foreach json part in parts {
+            map<json> partObj = part is map<json> ? <map<json>>part : {};
+            json fnResponse = partObj["functionResponse"];
+            if fnResponse is map<json> {
+                return fnResponse["response"] is map<json> ? <map<json>>fnResponse["response"] : {};
+            }
+        }
+    }
+    return {};
 }
 
 // Returns the first part of `contents[0]` that carries `key`, or `{}` when none.
@@ -284,7 +359,8 @@ isolated function buildTextResponse(string text) returns json => {
 isolated function buildToolCallResponse(string name, map<json> args) returns json => {
     candidates: [
         {
-            content: {role: "model", parts: [{functionCall: {name, args}}]},
+            // Gemini emits an `id` on function calls so parallel calls can be correlated.
+            content: {role: "model", parts: [{functionCall: {id: "call-1", name, args}}]},
             finishReason: "STOP",
             index: 0
         }

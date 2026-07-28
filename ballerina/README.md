@@ -57,7 +57,7 @@ import ballerina/ai;
 import ballerinax/ai.google.gemini;
 
 final ai:EmbeddingProvider embeddingModel =
-    check new gemini:EmbeddingProvider("<API_KEY>", gemini:GEMINI_EMBEDDING_001);
+    check new gemini:EmbeddingProvider("<API_KEY>", gemini:GEMINI_EMBEDDING_2);
 
 public function main() returns error? {
     ai:Embedding embedding = check embeddingModel->embed({content: "Ballerina is a cloud-native language."});

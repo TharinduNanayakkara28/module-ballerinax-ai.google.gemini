@@ -1,6 +1,6 @@
-// Copyright (c) 2026 WSO2 LLC. (http://www.wso2.org).
+// Copyright (c) 2026 WSO2 LLC (http://www.wso2.com).
 //
-// WSO2 Inc. licenses this file to you under the Apache License,
+// WSO2 LLC. licenses this file to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.
 // You may obtain a copy of the License at
@@ -25,7 +25,7 @@ const IMAGE_URL = "http://localhost:8080/llm/assets/sample.png";
 const PDF_URL = "http://localhost:8080/llm/assets/sample.pdf";
 
 final ModelProvider provider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL);
-final EmbeddingProvider embeddingProvider = check new (API_KEY, GEMINI_EMBEDDING_001, SERVICE_URL);
+final EmbeddingProvider embeddingProvider = check new (API_KEY, GEMINI_EMBEDDING_2, SERVICE_URL);
 
 // ── chat ───────────────────────────────────────────────────────────────────
 
@@ -122,6 +122,95 @@ function testChatWithStopSequence() returns ai:Error? {
     ai:ChatAssistantMessage result =
         check provider->chat([{role: ai:USER, content: "Stop test"}], [], "END");
     test:assertEquals(result.content, "Stopping now.");
+}
+
+@test:Config
+function testChatTruncatedByThinkingReturnsError() returns error? {
+    // Thinking tokens are billed against maxOutputTokens, so a candidate can come back
+    // with finishReason MAX_TOKENS and no text part. That must be an actionable error,
+    // not an assistant message with content = ().
+    ai:ChatAssistantMessage|ai:Error result =
+        provider->chat([{role: ai:USER, content: "Truncated by thinking"}], []);
+    test:assertTrue(result is ai:LlmInvalidResponseError,
+            "a candidate with no usable content must surface as ai:LlmInvalidResponseError");
+    string message = (<ai:Error>result).message();
+    test:assertTrue(message.includes("MAX_TOKENS"), "the error must name the finishReason");
+    test:assertTrue(message.includes("thinkingBudget"),
+            "the error should point at the thinking-token cause");
+}
+
+@test:Config
+function testChatSafetyFinishReasonReturnsError() returns error? {
+    ai:ChatAssistantMessage|ai:Error result =
+        provider->chat([{role: ai:USER, content: "Safety filtered"}], []);
+    test:assertTrue(result is ai:LlmInvalidResponseError,
+            "a SAFETY-filtered candidate must surface as ai:LlmInvalidResponseError");
+    test:assertTrue((<ai:Error>result).message().includes("SAFETY"),
+            "the error must name the finishReason");
+}
+
+@test:Config
+function testChatBlockedPromptReturnsError() returns error? {
+    ai:ChatAssistantMessage|ai:Error result =
+        provider->chat([{role: ai:USER, content: "Blocked prompt"}], []);
+    test:assertTrue(result is ai:LlmInvalidResponseError,
+            "a blocked prompt must surface as ai:LlmInvalidResponseError");
+    test:assertTrue((<ai:Error>result).message().includes("PROHIBITED_CONTENT"),
+            "the error must name the promptFeedback block reason");
+}
+
+@test:Config
+function testChatToolResultWithJsonArrayStaysStructured() returns ai:Error? {
+    // A tool returning a JSON array must reach the model as {"result":[1,2,3]}, not
+    // {"result":"[1,2,3]"}. The mock asserts the wire shape.
+    ai:ChatMessage[] messages = [
+        {role: ai:USER, content: "Array tool result"},
+        {role: ai:ASSISTANT, toolCalls: [{name: "getScores", arguments: {}}]},
+        {role: "function", name: "getScores", content: "[1, 2, 3]"}
+    ];
+    _ = check provider->chat(messages, []);
+}
+
+@test:Config
+function testChatToolCallIdRoundTrips() returns ai:Error? {
+    // Gemini emits an `id` on parallel function calls; it must survive into
+    // ai:FunctionCall so results can be attributed to the right call.
+    ai:ChatAssistantMessage result =
+        check provider->chat([{role: ai:USER, content: "What's the weather in Colombo?"}], []);
+    ai:FunctionCall[]? toolCalls = result.toolCalls;
+    test:assertTrue(toolCalls is ai:FunctionCall[], "expected a tool call");
+    test:assertEquals((<ai:FunctionCall[]>toolCalls)[0].id, "call-1",
+            "the functionCall id must be carried into ai:FunctionCall");
+}
+
+@test:Config
+function testChatMultipleSystemMessagesAreSeparated() returns ai:Error? {
+    // Gemini concatenates systemInstruction parts with no separator, so without an
+    // explicit newline the two instructions would run together.
+    // The mock dispatches on the first *user* text, so that carries the marker.
+    _ = check provider->chat([
+        {role: ai:SYSTEM, content: "Be concise."},
+        {role: ai:SYSTEM, content: "You are a helpful assistant."},
+        {role: ai:USER, content: "Multi system check"}
+    ], []);
+}
+
+@test:Config
+function testChatApiErrorSurfacesGeminiEnvelope() returns error? {
+    // A 400 is not a connection problem. It must not be reported as one, and the
+    // API's own error envelope must reach the caller.
+    ai:ChatAssistantMessage|ai:Error result =
+        provider->chat([{role: ai:USER, content: "Trigger API error"}], []);
+    test:assertTrue(result is ai:Error, "a 4xx must surface as an error");
+    ai:Error err = <ai:Error>result;
+    test:assertFalse(err is ai:LlmConnectionError,
+            "a 400 must not be reported as ai:LlmConnectionError");
+    string message = err.message();
+    test:assertTrue(message.includes("400"), "the error must name the HTTP status");
+    test:assertTrue(message.includes("INVALID_ARGUMENT"),
+            "the error must carry Gemini's error.status");
+    test:assertTrue(message.includes("Invalid JSON payload received."),
+            "the error must carry Gemini's error.message");
 }
 
 // ── generate (structured output) ─────────────────────────────────────────────
@@ -287,6 +376,28 @@ function testBatchEmbed() returns ai:Error? {
     ai:Embedding[] embeddings = check embeddingProvider->batchEmbed(chunks);
     test:assertEquals(embeddings.length(), 2);
     test:assertEquals(embeddings[0], <float[]>[0.1, 0.2]);
+}
+
+@test:Config
+function testBatchEmbedEmptyInputReturnsEmpty() returns ai:Error? {
+    // Gemini rejects an empty `requests` array with a 400, so this must not reach the API.
+    ai:Embedding[] embeddings = check embeddingProvider->batchEmbed([]);
+    test:assertEquals(embeddings.length(), 0);
+}
+
+@test:Config
+function testBatchEmbedLengthMismatchIsDetected() returns ai:Error? {
+    // The mock returns exactly two embeddings, so three chunks force a short response.
+    // Silently returning it would misalign every chunk with the wrong vector.
+    ai:TextChunk[] chunks = [{content: "first"}, {content: "second"}, {content: "third"}];
+    ai:Embedding[]|ai:Error embeddings = embeddingProvider->batchEmbed(chunks);
+    test:assertTrue(embeddings is ai:Error,
+            "a response with fewer embeddings than chunks must be rejected, not silently misaligned");
+    string message = (<ai:Error>embeddings).message();
+    test:assertTrue(message.includes("Expected 3 embeddings"),
+            "the error must state how many embeddings were expected");
+    test:assertTrue(message.includes("received 2"),
+            "the error must state how many embeddings were actually returned");
 }
 
 @test:Config

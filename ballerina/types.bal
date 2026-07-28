@@ -85,12 +85,28 @@ public type ConnectionConfig record {|
 # (TTS/audio, image/video generation, embeddings) are intentionally excluded.
 @display {label: "Gemini Model Names"}
 public enum GEMINI_MODEL_NAMES {
-    GEMINI_3_1_PRO_PREVIEW = "gemini-3.1-pro-preview",
+    # Generally available since 2026-07-21. The current flagship Flash model and the
+    # recommended default for new integrations.
+    GEMINI_3_6_FLASH = "gemini-3.6-flash",
+    # Generally available since 2026-05-19.
     GEMINI_3_5_FLASH = "gemini-3.5-flash",
-    GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview",
+    # Generally available since 2026-07-21. The recommended low-cost tier.
+    GEMINI_3_5_FLASH_LITE = "gemini-3.5-flash-lite",
+    # Generally available since 2026-05-07. Scheduled for shutdown on 2027-05-07;
+    # migrate to `GEMINI_3_5_FLASH_LITE`.
     GEMINI_3_1_FLASH_LITE = "gemini-3.1-flash-lite",
+    # Preview model, available since 2026-02-19. Preview models may change or be
+    # withdrawn at short notice; avoid depending on them in production.
+    GEMINI_3_1_PRO_PREVIEW = "gemini-3.1-pro-preview",
+    # Preview model, available since 2025-12-17. Superseded by `GEMINI_3_6_FLASH`,
+    # though no shutdown date has been announced.
+    GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview",
+    # Scheduled for shutdown on 2026-10-16; migrate to `GEMINI_3_1_PRO_PREVIEW`.
+    # Note: thinking cannot be disabled on this model.
     GEMINI_2_5_PRO = "gemini-2.5-pro",
+    # Scheduled for shutdown on 2026-10-16; migrate to `GEMINI_3_6_FLASH`.
     GEMINI_2_5_FLASH = "gemini-2.5-flash",
+    # Scheduled for shutdown on 2026-10-16; migrate to `GEMINI_3_5_FLASH_LITE`.
     GEMINI_2_5_FLASH_LITE = "gemini-2.5-flash-lite"
 }
 
@@ -99,11 +115,20 @@ public enum GEMINI_MODEL_NAMES {
 # NOTE: Verify against the live `/v1beta/models` listing before relying on these.
 @display {label: "Gemini Embedding Model Names"}
 public enum GEMINI_EMBEDDING_MODEL_NAMES {
+    # The current model and the first multimodal embedding model in the Gemini API,
+    # mapping text, images, video, audio, and documents into a unified embedding space.
+    # Recommended for new integrations. For text-only tasks, task instructions are given
+    # directly in the prompt rather than through a task-type parameter.
     GEMINI_EMBEDDING_2 = "gemini-embedding-2",
+    # Remains available and supported for text-only use cases. Uses an explicit task-type
+    # parameter to optimise embeddings for the intended relationship.
+    #
+    # Note: the embedding spaces of the two models are incompatible. Switching between
+    # them requires re-embedding all previously stored data.
     GEMINI_EMBEDDING_001 = "gemini-embedding-001"
 }
 
-// ── Gemini wire types (generateContent / streamGenerateContent) ─────────────
+// ── Gemini wire types (generateContent) ────────────────────────────────────
 // Hand-written records modelling the subset of the Gemini `generateContent`
 // REST API that this connector uses. Records consumed from responses are kept
 // open (`record { }`) so that fields we do not model (e.g. safetyRatings,
@@ -112,7 +137,7 @@ public enum GEMINI_EMBEDDING_MODEL_NAMES {
 // Reference: https://ai.google.dev/api/generate-content
 
 # Inline binary data carried within a content part (e.g. an image), base64-encoded.
-public type InlineData record {
+type InlineData record {
     # IANA media type of the data, e.g. "image/png"
     string mimeType;
     # Base64-encoded bytes of the data
@@ -123,7 +148,7 @@ public type InlineData record {
 # uploaded via the Gemini File API (the URI returned by the upload). Gemini does
 # not fetch arbitrary web URLs here, so ordinary image/document URLs are downloaded
 # by the connector and sent as `InlineData` instead.
-public type FileData record {
+type FileData record {
     # IANA media type of the referenced file, e.g. "application/pdf". Optional;
     # Gemini can infer it for File API URIs
     string mimeType?;
@@ -132,7 +157,11 @@ public type FileData record {
 };
 
 # A function call requested by the model within a candidate part.
-public type FunctionCall record {
+type FunctionCall record {
+    # Correlation identifier for the call. Gemini emits this when several functions are
+    # called in one turn, and the matching `FunctionResponse` must echo it back so results
+    # can be attributed to the right call
+    string id?;
     # Name of the function the model intends to call
     string name;
     # Structured arguments for the call, as a JSON object
@@ -140,16 +169,19 @@ public type FunctionCall record {
 };
 
 # The result of a tool/function execution, fed back to the model.
-public type FunctionResponse record {
+type FunctionResponse record {|
+    # Correlation identifier echoed from the originating `FunctionCall`. Required to
+    # disambiguate results when the model issued several parallel calls of the same name
+    string id?;
     # Name of the function that was executed
     string name;
     # The function's result payload, as a JSON object
     map<json> response;
-};
+|};
 
 # A single piece of content. A part holds exactly one of the optional members;
 # the others are absent.
-public type Part record {
+type Part record {
     # Plain text content
     string text?;
     # Inline binary data (e.g. an image or PDF)
@@ -163,7 +195,7 @@ public type Part record {
 };
 
 # An ordered collection of parts attributed to a single role.
-public type Content record {
+type Content record {
     # Author of the content: "user" (input) or "model" (model output). Omitted
     # for `systemInstruction`.
     string role?;
@@ -172,38 +204,58 @@ public type Content record {
 };
 
 # Declares a function the model may call, described with a JSON-schema parameter object.
-public type FunctionDeclaration record {
+type FunctionDeclaration record {|
     # Function name
     string name;
     # Natural-language description of what the function does
     string description?;
-    # JSON-schema object describing the function parameters
+    # Function parameters described with Gemini's OpenAPI 3.0 schema subset. Mutually
+    # exclusive with `parametersJsonSchema`.
     map<json> parameters?;
-};
+    # Function parameters described with standard JSON Schema. Supported on Gemini 2.5
+    # models and later, and accepts keywords the `parameters` subset rejects, including
+    # `$ref`, `$defs`, `additionalProperties`, and `prefixItems`. Mutually exclusive
+    # with `parameters`.
+    map<json> parametersJsonSchema?;
+|};
 
 # A group of tools made available to the model.
-public type Tool record {
+type Tool record {|
     # Function declarations the model may call
     FunctionDeclaration[] functionDeclarations?;
-};
+|};
 
 # Controls how the model selects functions to call.
-public type FunctionCallingConfig record {
+type FunctionCallingConfig record {|
     # Calling mode: "AUTO" (model decides), "ANY" (must call a function),
     # or "NONE" (never call)
     string mode?;
     # When mode is "ANY", restricts the model to these function names
     string[] allowedFunctionNames?;
-};
+|};
 
 # Tool-related configuration for a request.
-public type ToolConfig record {
+type ToolConfig record {|
     # Function-calling behaviour configuration
     FunctionCallingConfig functionCallingConfig?;
-};
+|};
+
+# Controls the model's internal reasoning ("thinking").
+#
+# Gemini 2.5 models and later think by default, and thinking tokens are billed against
+# `maxOutputTokens`. A small `maxOutputTokens` can therefore be consumed entirely by
+# reasoning, yielding a candidate with `finishReason` "MAX_TOKENS" and no text part.
+type ThinkingConfig record {|
+    # Token budget the model may spend on internal reasoning. `0` disables thinking on
+    # models that permit it; `-1` lets the model choose its own budget dynamically.
+    # Omitted entirely when unset, so the model's default applies.
+    int thinkingBudget?;
+    # Whether thought summaries are included in the response parts
+    boolean includeThoughts?;
+|};
 
 # Generation parameters controlling sampling and output shape.
-public type GenerationConfig record {
+type GenerationConfig record {|
     # Sampling temperature
     decimal temperature?;
     # Upper bound on tokens generated in the response
@@ -217,21 +269,31 @@ public type GenerationConfig record {
     string[] stopSequences?;
     # Forces a response MIME type, e.g. "application/json" for structured output
     string responseMimeType?;
-    # JSON schema the structured response must conform to (used with
-    # `responseMimeType` = "application/json")
+    # Structured-response schema in Gemini's OpenAPI 3.0 subset (used with
+    # `responseMimeType` = "application/json"). Mutually exclusive with
+    # `responseJsonSchema`.
     map<json> responseSchema?;
-};
+    # Structured-response schema in standard JSON Schema. Supported on Gemini 2.5 models
+    # and later, and accepts keywords the `responseSchema` subset rejects, including
+    # `$ref`, `$defs`, `additionalProperties`, and `prefixItems`. `responseMimeType` is
+    # still required. Mutually exclusive with `responseSchema` — Gemini rejects requests
+    # that set both.
+    map<json> responseJsonSchema?;
+    # Internal-reasoning configuration. Omitted when unset, so the model's default
+    # thinking behaviour applies.
+    ThinkingConfig thinkingConfig?;
+|};
 
 # A single safety category/threshold pairing.
-public type SafetySetting record {
+type SafetySetting record {|
     # Harm category, e.g. "HARM_CATEGORY_HARASSMENT"
     string category;
     # Blocking threshold, e.g. "BLOCK_NONE"
     string threshold;
-};
+|};
 
-# Request body for `:generateContent` and `:streamGenerateContent`.
-public type GenerateContentRequest record {
+# Request body for `:generateContent`.
+type GenerateContentRequest record {|
     # The conversation contents, ordered oldest to newest
     Content[] contents;
     # System-level instruction applied to the whole request
@@ -244,10 +306,10 @@ public type GenerateContentRequest record {
     GenerationConfig generationConfig?;
     # Safety category thresholds
     SafetySetting[] safetySettings?;
-};
+|};
 
 # A single generated candidate within a response.
-public type Candidate record {
+type Candidate record {
     # The generated content
     Content content?;
     # Why generation stopped, e.g. "STOP", "MAX_TOKENS", "SAFETY"
@@ -257,7 +319,7 @@ public type Candidate record {
 };
 
 # Token accounting for a request/response.
-public type UsageMetadata record {
+type UsageMetadata record {
     # Tokens counted in the prompt
     int promptTokenCount?;
     # Tokens counted across all generated candidates
@@ -267,7 +329,7 @@ public type UsageMetadata record {
 };
 
 # A safety rating for a single harm category.
-public type SafetyRating record {
+type SafetyRating record {
     # Harm category, e.g. "HARM_CATEGORY_HARASSMENT"
     string category?;
     # Assessed probability, e.g. "NEGLIGIBLE", "LOW", "MEDIUM", "HIGH"
@@ -278,7 +340,7 @@ public type SafetyRating record {
 
 # Feedback about the prompt itself, populated when Gemini returns no candidates
 # because the prompt was blocked.
-public type PromptFeedback record {
+type PromptFeedback record {
     # Reason the prompt was blocked, e.g. "SAFETY", "OTHER", "BLOCKLIST",
     # "PROHIBITED_CONTENT", "IMAGE_SAFETY"
     string blockReason?;
@@ -287,7 +349,7 @@ public type PromptFeedback record {
 };
 
 # Response body for `:generateContent`.
-public type GenerateContentResponse record {
+type GenerateContentResponse record {
     # Generated candidates; multiple only when more than one was requested
     Candidate[] candidates?;
     # Feedback about the prompt, including a block reason when the prompt is rejected
@@ -301,33 +363,33 @@ public type GenerateContentResponse record {
 // ── Gemini embedding wire types (embedContent / batchEmbedContents) ─────────
 
 # Request body for `:embedContent`.
-public type EmbedContentRequest record {
-    # The model resource name, e.g. "models/text-embedding-004"
+type EmbedContentRequest record {|
+    # The model resource name, e.g. "models/gemini-embedding-2"
     string model;
     # The content to embed
     Content content;
-};
+|};
 
 # An embedding vector.
-public type ContentEmbedding record {
+type ContentEmbedding record {
     # The embedding values
     float[] values;
 };
 
 # Response body for `:embedContent`.
-public type EmbedContentResponse record {
+type EmbedContentResponse record {
     # The generated embedding
     ContentEmbedding embedding;
 };
 
 # Request body for `:batchEmbedContents`.
-public type BatchEmbedContentsRequest record {
+type BatchEmbedContentsRequest record {|
     # The individual embedding requests, one per input
     EmbedContentRequest[] requests;
-};
+|};
 
 # Response body for `:batchEmbedContents`.
-public type BatchEmbedContentsResponse record {
+type BatchEmbedContentsResponse record {
     # The generated embeddings, in request order
     ContentEmbedding[] embeddings;
 };
