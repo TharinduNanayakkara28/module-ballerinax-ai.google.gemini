@@ -71,6 +71,14 @@ public distinct isolated client class EmbeddingProvider {
             string path = string `/models/${self.modelType}:embedContent`;
             EmbedContentResponse response = check self.httpClient->post(path, request, headers);
 
+            span.addResponseModel(self.modelType);
+            UsageMetadata? usage = response.usageMetadata;
+            if usage is UsageMetadata {
+                int? inputTokens = usage.promptTokenCount;
+                if inputTokens is int {
+                    span.addInputTokenCount(inputTokens);
+                }
+            }
             ai:Embedding embedding = response.embedding.values;
             span.close();
             return embedding;
@@ -123,6 +131,7 @@ public distinct isolated client class EmbeddingProvider {
                     response.embeddings.length()}`);
             }
 
+            span.addResponseModel(self.modelType);
             ai:Embedding[] embeddings = [];
             foreach ContentEmbedding contentEmbedding in response.embeddings {
                 embeddings.push(contentEmbedding.values);

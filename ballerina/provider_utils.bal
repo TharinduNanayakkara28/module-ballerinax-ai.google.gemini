@@ -24,6 +24,13 @@ type ResponseSchema record {|
     boolean isOriginallyJsonObject = true;
 |};
 
+# Maximum size of a document fetched from a caller-supplied URL, in bytes (20 MiB).
+#
+# Matches Gemini's own 20 MB inline-request ceiling: anything larger could not be sent
+# as `inlineData` anyway. Without a cap, a URL taken from prompt data could stream an
+# unbounded body into memory.
+const int MAX_DOCUMENT_DOWNLOAD_SIZE = 20 * 1024 * 1024;
+
 const JSON_CONVERSION_ERROR = "FromJsonStringError";
 const CONVERSION_ERROR = "ConversionError";
 const ERROR_MESSAGE = "Error occurred while attempting to parse the response from the " +
@@ -227,9 +234,25 @@ isolated function downloadDocument(ai:Url url) returns [byte[], string?]|ai:Erro
     if response.statusCode < 200 || response.statusCode >= 300 {
         return error ai:Error(string `Failed to download the document from '${url}': status ${response.statusCode}.`);
     }
+    // The URL comes from caller-supplied prompt data, so this is an outbound fetch to an
+    // address the connector does not control. Reject an oversized body before reading it
+    // where the server declares its length, and again afterwards as a backstop for
+    // chunked responses that declare none.
+    string|error declaredLength = response.getHeader("Content-Length");
+    if declaredLength is string {
+        int|error contentLength = int:fromString(declaredLength);
+        if contentLength is int && contentLength > MAX_DOCUMENT_DOWNLOAD_SIZE {
+            return error ai:Error(string `The document at '${url}' is ${contentLength} bytes, which exceeds the ${
+                MAX_DOCUMENT_DOWNLOAD_SIZE} byte limit.`);
+        }
+    }
     byte[]|error payload = response.getBinaryPayload();
     if payload is error {
         return error ai:Error(string `Failed to read the downloaded document from '${url}'.`, payload);
+    }
+    if payload.length() > MAX_DOCUMENT_DOWNLOAD_SIZE {
+        return error ai:Error(string `The document at '${url}' is ${payload.length()} bytes, which exceeds the ${
+            MAX_DOCUMENT_DOWNLOAD_SIZE} byte limit.`);
     }
     return [payload, normalizeMimeType(response.getContentType())];
 }
@@ -295,6 +318,58 @@ isolated function handleParseResponseError(error chatResponseError) returns erro
         return error(string `${ERROR_MESSAGE}`, chatResponseError);
     }
     return chatResponseError;
+}
+
+# Total tokens billed as output for a response.
+#
+# Gemini reports reasoning tokens in `thoughtsTokenCount`, separately from
+# `candidatesTokenCount`, even though both are billed as output. Reporting only
+# `candidatesTokenCount` therefore under-reports cost — severely on thinking models,
+# where reasoning can account for most of the generation.
+#
+# + usage - The response's token accounting, if reported
+# + return - Candidate plus reasoning tokens, or `()` when neither is reported
+isolated function totalOutputTokenCount(UsageMetadata? usage) returns int? {
+    if usage is () {
+        return ();
+    }
+    int candidateTokens = usage.candidatesTokenCount ?: 0;
+    int thoughtTokens = usage.thoughtsTokenCount ?: 0;
+    int total = candidateTokens + thoughtTokens;
+    return total > 0 ? total : ();
+}
+
+# Records token usage and response identity from a `generateContent` response.
+#
+# Output tokens are reported as `candidatesTokenCount + thoughtsTokenCount`. Gemini
+# reports reasoning tokens separately even though they are billed as output, so counting
+# only `candidatesTokenCount` under-reports cost — by a wide margin on thinking models,
+# where reasoning can dominate the response.
+#
+# + span - The chat or generate-content span to annotate
+# + response - The response to read usage and identity from
+isolated function recordResponseTelemetry(observe:LlmSpan span, GenerateContentResponse response) {
+    UsageMetadata? usage = response.usageMetadata;
+    if usage is UsageMetadata {
+        int? inputTokens = usage.promptTokenCount;
+        if inputTokens is int {
+            span.addInputTokenCount(inputTokens);
+        }
+        int? outputTokens = totalOutputTokenCount(usage);
+        if outputTokens is int {
+            span.addOutputTokenCount(outputTokens);
+        }
+    }
+    string? responseId = response.responseId;
+    if responseId is string {
+        span.addResponseId(responseId);
+    }
+    // The concrete version behind a floating alias such as "gemini-3.6-flash"; without it
+    // a trace cannot say which model actually served the request.
+    string? modelVersion = response.modelVersion;
+    if modelVersion is string {
+        span.addResponseModel(modelVersion);
+    }
 }
 
 # Maps an HTTP failure from a Gemini call onto the `ai:LlmError` taxonomy.
@@ -470,22 +545,18 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
         return err;
     }
 
-    // Gemini's structured output (`responseSchema`) accepts only a subset of the
-    // OpenAPI 3.0 schema — broadly type, format, description, nullable, enum, items,
-    // properties, required and propertyOrdering. Keywords outside that subset
-    // ($schema/$ref/$defs, title, default, const, additionalProperties, and the
-    // oneOf/allOf combinators) are either rejected or ignored, so
-    // `sanitizeGeminiSchema` strips them before sending. Consequences to be aware of:
-    // a top-level `map<T>` return type is not supported by the schema generator at
-    // all (it errors), and a `map` used as a record field loses its value constraint
-    // once `additionalProperties` is stripped; `$ref`-based nested schemas are not
-    // resolved (they degrade to an unconstrained object); and very large or deeply
+    // Structured output is requested through `responseJsonSchema`, which accepts
+    // standard JSON Schema on Gemini 2.5 models and later — including `$ref`/`$defs`,
+    // `additionalProperties`, `title` and `prefixItems`. Only `oneOf`/`allOf` are
+    // rewritten (to the documented `anyOf`). `responseSchema` must be left unset:
+    // Gemini rejects a request that carries both. Note a top-level `map<T>` return type
+    // is still unsupported by the schema generator itself, and very large or deeply
     // nested schemas may still be rejected by the API.
-    map<json> sanitizedSchema = sanitizeGeminiObjectSchema(responseSchema.schema);
+    map<json> normalizedSchema = normalizeJsonObjectSchema(responseSchema.schema);
     GenerationConfig generationConfig = {
         maxOutputTokens: maxTokens,
         responseMimeType: JSON_MIME_TYPE,
-        responseSchema: sanitizedSchema
+        responseJsonSchema: normalizedSchema
     };
     if temperature is decimal {
         generationConfig.temperature = temperature;
@@ -515,17 +586,7 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
         return err;
     }
 
-    UsageMetadata? usage = response.usageMetadata;
-    if usage is UsageMetadata {
-        int? inputTokens = usage.promptTokenCount;
-        if inputTokens is int {
-            span.addInputTokenCount(inputTokens);
-        }
-        int? outputTokens = usage.candidatesTokenCount;
-        if outputTokens is int {
-            span.addOutputTokenCount(outputTokens);
-        }
-    }
+    recordResponseTelemetry(span, response);
 
     string? generatedText = extractTextFromCandidate(candidates[0]);
     if generatedText is () {

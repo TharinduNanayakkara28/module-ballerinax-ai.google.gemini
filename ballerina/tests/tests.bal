@@ -98,7 +98,7 @@ function testChatMultiTurnToolConversation() returns ai:Error? {
 }
 
 @test:Config
-function testChatSanitizesToolSchema() returns ai:Error? {
+function testChatSendsToolSchemaAsJsonSchema() returns ai:Error? {
     ai:ChatCompletionFunctions tool = {
         name: "getWeather",
         description: "Get the weather for a city",
@@ -113,7 +113,7 @@ function testChatSanitizesToolSchema() returns ai:Error? {
         }
     };
     ai:ChatAssistantMessage result =
-        check provider->chat([{role: ai:USER, content: "Sanitize schema test"}], [tool]);
+        check provider->chat([{role: ai:USER, content: "Tool schema passthrough test"}], [tool]);
     test:assertTrue(result.toolCalls is ai:FunctionCall[], "expected a tool call in the response");
 }
 
@@ -157,6 +157,23 @@ function testChatBlockedPromptReturnsError() returns error? {
             "a blocked prompt must surface as ai:LlmInvalidResponseError");
     test:assertTrue((<ai:Error>result).message().includes("PROHIBITED_CONTENT"),
             "the error must name the promptFeedback block reason");
+}
+
+@test:Config
+function testChatNormalizesOneOfToAnyOf() returns ai:Error? {
+    // Nilable and union types produce `oneOf`, which Gemini does not document as
+    // supported. It must be rewritten to `anyOf`; the mock asserts the wire shape.
+    ai:ChatCompletionFunctions tool = {
+        name: "setValue",
+        description: "Sets an optional value",
+        parameters: {
+            "type": "object",
+            "properties": {
+                "value": {"oneOf": [{"type": "string"}, {"type": "null"}]}
+            }
+        }
+    };
+    _ = check provider->chat([{role: ai:USER, content: "Union schema test"}], [tool]);
 }
 
 @test:Config
@@ -213,6 +230,60 @@ function testChatApiErrorSurfacesGeminiEnvelope() returns error? {
             "the error must carry Gemini's error.message");
 }
 
+@test:Config
+function testChatAuthErrorIsNotAConnectionError() returns error? {
+    ai:ChatAssistantMessage|ai:Error result =
+        provider->chat([{role: ai:USER, content: "Trigger auth error"}], []);
+    test:assertTrue(result is ai:Error, "a 401 must surface as an error");
+    ai:Error err = <ai:Error>result;
+    test:assertFalse(err is ai:LlmConnectionError,
+            "an invalid API key is not a connection failure");
+    test:assertTrue(err.message().includes("UNAUTHENTICATED"),
+            "the error must name Gemini's status so the cause is actionable");
+}
+
+@test:Config
+function testChatRateLimitIsNotAConnectionError() returns error? {
+    ai:ChatAssistantMessage|ai:Error result =
+        provider->chat([{role: ai:USER, content: "Trigger rate limit"}], []);
+    test:assertTrue(result is ai:Error, "a 429 must surface as an error");
+    ai:Error err = <ai:Error>result;
+    test:assertFalse(err is ai:LlmConnectionError,
+            "a rate limit is not a connection failure");
+    test:assertTrue(err.message().includes("RESOURCE_EXHAUSTED"),
+            "the error must name Gemini's status so callers can back off");
+}
+
+@test:Config
+function testChatToolResultWithScalarStaysStructured() returns ai:Error? {
+    // A tool returning a bare number must reach the model as {"result":42}, not
+    // {"result":"42"} — the same class of bug as the array case.
+    ai:ChatMessage[] messages = [
+        {role: ai:USER, content: "Scalar tool result"},
+        {role: ai:ASSISTANT, toolCalls: [{name: "getCount", arguments: {}}]},
+        {role: "function", name: "getCount", content: "42"}
+    ];
+    _ = check provider->chat(messages, []);
+}
+
+// ── telemetry ───────────────────────────────────────────────────────────────
+
+@test:Config
+function testOutputTokenCountIncludesThinkingTokens() {
+    // Reasoning tokens are billed as output but reported separately. Counting only
+    // candidatesTokenCount under-reports cost — here by 9x.
+    test:assertEquals(totalOutputTokenCount({candidatesTokenCount: 5, thoughtsTokenCount: 40}), 45,
+            "output tokens must include thoughtsTokenCount");
+    test:assertEquals(totalOutputTokenCount({candidatesTokenCount: 5}), 5,
+            "a response without reasoning tokens must report candidate tokens unchanged");
+    test:assertEquals(totalOutputTokenCount({thoughtsTokenCount: 40}), 40,
+            "reasoning tokens must be reported even when no candidate tokens are returned");
+    test:assertEquals(totalOutputTokenCount(()), (),
+            "absent usage metadata must not be reported as zero");
+    test:assertEquals(totalOutputTokenCount({promptTokenCount: 10}), (),
+            "input-only usage must not report an output count");
+}
+
 // ── generate (structured output) ─────────────────────────────────────────────
 
 @test:Config
@@ -247,6 +318,15 @@ function testGenerateStringReturnType() returns error? {
 function testGenerateNestedRecordReturnType() returns error? {
     Person person = check provider->generate(`Extract the person from: Ada, 36, London, UK`);
     test:assertEquals(person, personRecord);
+}
+
+@test:Config
+function testGenerateNilableArrayReturnTypeNormalizesOneOf() returns error? {
+    // A nilable array member is the one runtime path that emits `oneOf`
+    // (to_json_schema.bal). Gemini does not document `oneOf`, so it must be rewritten
+    // to `anyOf` before the schema is sent. The mock asserts the wire shape.
+    (int?)[] ratings = check provider->generate(`Nilable array check: rate these blogs`);
+    test:assertEquals(ratings, <(int?)[]>[9, (), 1]);
 }
 
 @test:Config

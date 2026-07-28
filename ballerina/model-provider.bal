@@ -38,38 +38,29 @@ const API_KEY_HEADER = "x-goog-api-key";
 const GEMINI_ROLE_USER = "user";
 const GEMINI_ROLE_MODEL = "model";
 
-# JSON-schema keywords that the Gemini function-declaration / response schema
-# does not accept; stripped before sending tool parameters or a `responseSchema`.
-# Gemini only accepts a subset of OpenAPI 3.0 (type, format, description, nullable,
-# enum, items, properties, required, ...), so metadata keywords, `$ref`/`$defs`
-# indirection, and validation keywords like `default`/`const` are removed. Note
-# that stripping `$ref`/`$defs` drops the reference rather than resolving it, so
-# `$ref`-based (nested-record) tool schemas degrade to an unconstrained object.
-final string[] & readonly UNSUPPORTED_SCHEMA_KEYS = [
-    "$schema",
-    "$id",
-    "$comment",
-    "$anchor",
-    "$ref",
-    "$defs",
-    "definitions",
-    "title",
-    "default",
-    "const",
-    "additionalProperties"
-];
+# Schema combinators that are normalised to `anyOf` before sending.
+#
+# Tool and response schemas are sent through Gemini's standard-JSON-Schema fields
+# (`parametersJsonSchema` / `responseJsonSchema`), which accept `$ref`, `$defs`,
+# `additionalProperties`, `title` and `prefixItems` directly — so no keyword stripping
+# is required. `anyOf` is explicitly documented as the supported union combinator,
+# while `oneOf` and `allOf` are not listed, so they are rewritten to `anyOf`.
+#
+# For a union type this is semantically equivalent in practice: the generated schemas
+# describe mutually exclusive alternatives, which `anyOf` also satisfies.
+# Reference: https://blog.google/innovation-and-ai/technology/developers-tools/gemini-api-structured-outputs/
+final string[] & readonly NORMALIZED_SCHEMA_COMBINATORS = ["oneOf", "allOf"];
 
 # ModelProvider is a client class that provides an interface for interacting with Gemini Large Language Models.
 public isolated distinct client class ModelProvider {
     *ai:ModelProvider;
     // A single raw HTTP client posts JSON to the Gemini `:generateContent` API.
     private final http:Client httpClient;
+    // Read by the native `Generator` shim via field lookup; see `Generator.java`.
     private final string apiKey;
     private final GEMINI_MODEL_NAMES modelType;
     private final decimal? temperature;
     private final int maxTokens;
-    private final decimal? topP;
-    private final int? topK;
     private final int? thinkingBudget;
 
     # Initializes the Gemini model with the given connection configuration and model configuration.
@@ -87,10 +78,6 @@ public isolated distinct client class ModelProvider {
     #                    thinking on models that permit it, `-1` lets the model choose
     #                    dynamically. Left unset when `()`. Thinking tokens are billed against
     #                    `maxTokens`
-    # + topP - Nucleus sampling threshold; the model considers tokens whose cumulative
-    #          probability mass is within this value. Left unset when `()`
-    # + topK - Top-k sampling limit; the model samples from the `topK` most probable
-    #          tokens. Left unset when `()`
     # + connectionConfig - Additional HTTP connection configuration
     # + return - `()` on successful initialization; otherwise, returns an `ai:Error`
     public isolated function init(@display {label: "API Key"} string apiKey,
@@ -98,8 +85,6 @@ public isolated distinct client class ModelProvider {
             @display {label: "Service URL"} string serviceUrl = DEFAULT_GEMINI_SERVICE_URL,
             @display {label: "Maximum Tokens"} int maxTokens = DEFAULT_MAX_TOKEN_COUNT,
             @display {label: "Temperature"} decimal? temperature = (),
-            @display {label: "Top P"} decimal? topP = (),
-            @display {label: "Top K"} int? topK = (),
             @display {label: "Thinking Budget"} int? thinkingBudget = (),
             @display {label: "Connection Configuration"} *ConnectionConfig connectionConfig) returns ai:Error? {
         // `ConnectionConfig` is a field-compatible subset of `http:ClientConfiguration`
@@ -114,8 +99,6 @@ public isolated distinct client class ModelProvider {
         self.modelType = modelType;
         self.temperature = temperature;
         self.maxTokens = maxTokens;
-        self.topP = topP;
-        self.topK = topK;
         self.thinkingBudget = thinkingBudget;
     }
 
@@ -146,6 +129,9 @@ public isolated distinct client class ModelProvider {
             span.close(request);
             return request;
         }
+        if tools.length() > 0 {
+            span.addTools(tools);
+        }
 
         map<string|string[]> headers = {[API_KEY_HEADER]: self.apiKey};
         string path = string `/models/${self.modelType}:generateContent`;
@@ -164,17 +150,7 @@ public isolated distinct client class ModelProvider {
         }
         Candidate candidate = candidates[0];
 
-        UsageMetadata? usage = response.usageMetadata;
-        if usage is UsageMetadata {
-            int? inputTokens = usage.promptTokenCount;
-            if inputTokens is int {
-                span.addInputTokenCount(inputTokens);
-            }
-            int? outputTokens = usage.candidatesTokenCount;
-            if outputTokens is int {
-                span.addOutputTokenCount(outputTokens);
-            }
-        }
+        recordResponseTelemetry(span, response);
         string? finishReason = candidate.finishReason;
         if finishReason is string {
             span.addFinishReason(finishReason);
@@ -254,14 +230,6 @@ public isolated distinct client class ModelProvider {
         int? thinkingBudget = self.thinkingBudget;
         if thinkingBudget is int {
             generationConfig.thinkingConfig = {thinkingBudget};
-        }
-        decimal? topP = self.topP;
-        if topP is decimal {
-            generationConfig.topP = topP;
-        }
-        int? topK = self.topK;
-        if topK is int {
-            generationConfig.topK = topK;
         }
         if stop is string {
             generationConfig.stopSequences = [stop];
@@ -383,8 +351,9 @@ isolated function buildFunctionResponseContent(ai:ChatFunctionMessage message) r
     return {role: GEMINI_ROLE_USER, parts: [{functionResponse}]};
 }
 
-# Converts `ai` tool definitions into Gemini function declarations, sanitizing the
-# parameter JSON schema of keywords Gemini does not accept.
+# Converts `ai` tool definitions into Gemini function declarations, sending the
+# parameter schema through `parametersJsonSchema` so standard JSON Schema — including
+# `$ref`/`$defs` for nested records — is accepted as-is.
 #
 # + tools - The tool definitions
 # + return - The function declarations for a single Gemini `Tool`
@@ -394,7 +363,7 @@ isolated function convertTools(ai:ChatCompletionFunctions[] tools) returns Funct
         FunctionDeclaration declaration = {name: tool.name, description: tool.description};
         map<json>? params = tool?.parameters;
         if params is map<json> {
-            declaration.parameters = sanitizeGeminiObjectSchema(params);
+            declaration.parametersJsonSchema = normalizeJsonObjectSchema(params);
         }
         declarations.push(declaration);
     }
@@ -406,32 +375,30 @@ isolated function convertTools(ai:ChatCompletionFunctions[] tools) returns Funct
 #
 # + schema - The schema (object, array, or scalar) to sanitize
 # + return - The sanitized schema
-isolated function sanitizeGeminiSchema(json schema) returns json {
+isolated function normalizeJsonSchema(json schema) returns json {
     if schema is map<json> {
-        return sanitizeGeminiObjectSchema(schema);
+        return normalizeJsonObjectSchema(schema);
     }
     if schema is json[] {
-        return schema.'map(item => sanitizeGeminiSchema(item));
+        return schema.'map(item => normalizeJsonSchema(item));
     }
     return schema;
 }
 
-# Sanitizes an object schema, preserving the object type.
+# Normalises an object schema for Gemini's standard-JSON-Schema fields.
 #
-# `sanitizeGeminiSchema` is `json -> json`, which forced call sites into a
-# `sanitized is map<json> ? sanitized : original` ternary. That fallback would have sent
-# the *unsanitized* schema — exactly what the sanitizer exists to prevent. The branch was
-# unreachable, but the intent was inverted; returning `map<json>` removes the need for it.
+# Only `oneOf` / `allOf` are rewritten (to `anyOf`); every other keyword is passed
+# through untouched, because `parametersJsonSchema` and `responseJsonSchema` accept
+# standard JSON Schema. Returning `map<json>` rather than `json` keeps the object type
+# so call sites need no fallback.
 #
-# + schema - The object schema to sanitize
-# + return - The sanitized object schema
-isolated function sanitizeGeminiObjectSchema(map<json> schema) returns map<json> {
+# + schema - The object schema to normalise
+# + return - The normalised object schema
+isolated function normalizeJsonObjectSchema(map<json> schema) returns map<json> {
     map<json> result = {};
     foreach [string, json] [key, value] in schema.entries() {
-        if UNSUPPORTED_SCHEMA_KEYS.indexOf(key) is int {
-            continue;
-        }
-        result[key] = sanitizeGeminiSchema(value);
+        string targetKey = NORMALIZED_SCHEMA_COMBINATORS.indexOf(key) is int ? "anyOf" : key;
+        result[targetKey] = normalizeJsonSchema(value);
     }
     return result;
 }

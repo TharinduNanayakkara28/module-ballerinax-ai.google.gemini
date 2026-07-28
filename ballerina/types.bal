@@ -260,11 +260,6 @@ type GenerationConfig record {|
     decimal temperature?;
     # Upper bound on tokens generated in the response
     int maxOutputTokens?;
-    # Nucleus sampling threshold; tokens are considered until their cumulative
-    # probability mass reaches this value
-    decimal topP?;
-    # Top-k sampling limit; sampling is restricted to the `topK` most probable tokens
-    int topK?;
     # Sequences that, when produced, stop generation
     string[] stopSequences?;
     # Forces a response MIME type, e.g. "application/json" for structured output
@@ -322,9 +317,18 @@ type Candidate record {
 type UsageMetadata record {
     # Tokens counted in the prompt
     int promptTokenCount?;
-    # Tokens counted across all generated candidates
+    # Tokens counted across all generated candidates. Note this **excludes** tokens spent
+    # on internal reasoning — see `thoughtsTokenCount`
     int candidatesTokenCount?;
-    # Total tokens (prompt + candidates)
+    # Tokens spent on internal reasoning. Billed as output, but reported separately from
+    # `candidatesTokenCount`, so output cost is under-reported if this is ignored — by a
+    # wide margin on thinking models
+    int thoughtsTokenCount?;
+    # Tokens served from cached content, billed at a reduced rate
+    int cachedContentTokenCount?;
+    # Tokens consumed by tool-use prompts
+    int toolUsePromptTokenCount?;
+    # Total tokens across every category above
     int totalTokenCount?;
 };
 
@@ -350,6 +354,8 @@ type PromptFeedback record {
 
 # Response body for `:generateContent`.
 type GenerateContentResponse record {
+    # Identifier for this response, useful for correlating traces with Gemini-side logs
+    string responseId?;
     # Generated candidates; multiple only when more than one was requested
     Candidate[] candidates?;
     # Feedback about the prompt, including a block reason when the prompt is rejected
@@ -380,6 +386,8 @@ type ContentEmbedding record {
 type EmbedContentResponse record {
     # The generated embedding
     ContentEmbedding embedding;
+    # Token accounting for the embedding request, when reported
+    UsageMetadata usageMetadata?;
 };
 
 # Request body for `:batchEmbedContents`.

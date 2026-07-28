@@ -23,8 +23,13 @@ import ballerina/test;
 // asserted (per scenario) before a response is returned, so the request-building
 // layer unique to Gemini is covered.
 service /llm on new http:Listener(8080) {
-    resource function post models/[string operation](@http:Payload json payload)
+    resource function post models/[string operation](@http:Payload json payload,
+            @http:Header {name: "x-goog-api-key"} string? apiKeyHeader = ())
             returns json|http:Response|error {
+        // Authentication must not silently break: every request, on every endpoint,
+        // has to carry the API key in the documented header.
+        test:assertEquals(apiKeyHeader, API_KEY,
+                string `'x-goog-api-key' must be sent on ${operation}`);
         if operation.endsWith(":embedContent") {
             // Simulate an upstream/runtime failure for a designated input.
             if embedInputText(payload) == "trigger-runtime-error" {
@@ -45,7 +50,7 @@ service /llm on new http:Listener(8080) {
         if promptText.startsWith("Weather follow-up") {
             return buildTextResponse("It is 20 degrees in Paris.");
         }
-        if promptText.startsWith("Sanitize schema") {
+        if promptText.startsWith("Tool schema passthrough") {
             return buildToolCallResponse("getWeather", {city: "Paris"});
         }
         // A truncated candidate: thinking consumed the whole token budget, so the
@@ -60,6 +65,24 @@ service /llm on new http:Listener(8080) {
         // A blocked prompt: Gemini returns no candidates, only promptFeedback.
         if promptText.startsWith("Blocked prompt") {
             return {candidates: [], promptFeedback: {blockReason: "PROHIBITED_CONTENT"}};
+        }
+        // 401 and 429 exercise the same mapping path as 400 but must not be reported as
+        // connection failures either — a bad key and a rate limit are distinct causes.
+        if promptText.startsWith("Trigger auth error") {
+            http:Response unauthorized = new;
+            unauthorized.statusCode = 401;
+            unauthorized.setJsonPayload({
+                'error: {code: 401, message: "API key not valid.", status: "UNAUTHENTICATED"}
+            });
+            return unauthorized;
+        }
+        if promptText.startsWith("Trigger rate limit") {
+            http:Response rateLimited = new;
+            rateLimited.statusCode = 429;
+            rateLimited.setJsonPayload({
+                'error: {code: 429, message: "Quota exceeded.", status: "RESOURCE_EXHAUSTED"}
+            });
+            return rateLimited;
         }
         // A 4xx carrying Gemini's error envelope, so the error-mapping path is covered.
         if promptText.startsWith("Trigger API error") {
@@ -128,16 +151,38 @@ function validateGenerateContentRequest(string promptText, json payload) {
         test:assertEquals((<json[]>declarations).length(), 2, "expected two function declarations");
     }
 
-    if promptText.startsWith("Sanitize schema") {
+    if promptText.startsWith("Tool schema passthrough") {
+        // Tool schemas go through `parametersJsonSchema`, which accepts standard JSON
+        // Schema. Keywords the old deny-list stripped must now survive intact —
+        // dropping `$ref` in particular degraded nested schemas to an unconstrained
+        // object, telling the model nothing about the expected arguments.
         map<json> params = toolParameters(obj);
         foreach string key in ["$schema", "title", "$ref", "default", "additionalProperties"] {
-            test:assertFalse(params.hasKey(key), string `expected unsupported schema key '${key}' to be stripped`);
+            test:assertTrue(params.hasKey(key),
+                    string `'${key}' must pass through to parametersJsonSchema, not be stripped`);
         }
-        test:assertTrue(params.hasKey("properties"), "expected 'properties' to survive sanitization");
         map<json> props = params["properties"] is map<json> ? <map<json>>params["properties"] : {};
         map<json> city = props["city"] is map<json> ? <map<json>>props["city"] : {};
-        test:assertFalse(city.hasKey("default"), "expected nested 'default' to be stripped");
+        test:assertEquals(city["default"], "Colombo", "nested 'default' must survive");
         test:assertEquals(city["type"], "string");
+    }
+
+    if promptText.startsWith("Union schema") {
+        // `oneOf`/`allOf` are not documented as supported; `anyOf` is. They must be
+        // rewritten rather than sent verbatim.
+        map<json> params = toolParameters(obj);
+        map<json> props = params["properties"] is map<json> ? <map<json>>params["properties"] : {};
+        map<json> value = props["value"] is map<json> ? <map<json>>props["value"] : {};
+        test:assertFalse(value.hasKey("oneOf"), "'oneOf' must be normalised away");
+        test:assertTrue(value.hasKey("anyOf"), "'oneOf' must be rewritten to 'anyOf'");
+        test:assertEquals(value["anyOf"], <json[]>[{"type": "string"}, {"type": "null"}],
+                "the union members must be preserved unchanged");
+    }
+
+    if promptText.startsWith("Scalar tool result") {
+        map<json> fnResponse = functionResponsePayload(obj);
+        test:assertEquals(fnResponse["result"], 42,
+                "a scalar tool result must stay a number, not become a string");
     }
 
     if promptText.startsWith("Array tool result") {
@@ -161,6 +206,46 @@ function validateGenerateContentRequest(string promptText, json payload) {
     if promptText.startsWith("Stop test") {
         map<json> genConfig = generationConfig(obj);
         test:assertEquals(genConfig["stopSequences"], <json[]>["END"]);
+    }
+
+    // Structured output must be requested via `responseJsonSchema`; Gemini rejects a
+    // request carrying both that and `responseSchema`.
+    if promptText.startsWith("Rate this blog") || promptText.startsWith("Give me a random joke")
+        || promptText.startsWith("Evaluate these blogs") || promptText.startsWith("Extract the person") {
+        map<json> genConfig = generationConfig(obj);
+        test:assertFalse(genConfig.hasKey("responseSchema"),
+                "responseSchema must be omitted when responseJsonSchema is used");
+        test:assertTrue(genConfig.hasKey("responseJsonSchema"),
+                "structured output must be requested through responseJsonSchema");
+    }
+
+    if promptText.startsWith("Rate this blog") {
+        assertSchemaContains(responseJsonSchemaOf(obj), expectedIntResponseSchema(), "int return");
+    }
+    if promptText.startsWith("Nilable array check") {
+        // Regression guard: whatever the schema generator emits for a nilable member,
+        // no `oneOf`/`allOf` may reach Gemini — neither is a documented keyword.
+        string schema = responseJsonSchemaOf(obj).toJsonString();
+        test:assertFalse(schema.includes("oneOf"),
+                string `'oneOf' must not reach Gemini, got ${schema}`);
+        test:assertFalse(schema.includes("allOf"),
+                string `'allOf' must not reach Gemini, got ${schema}`);
+        // KNOWN DEFECT (pre-existing, in ported schema-generation code): a nilable array
+        // member is emitted as {"type": null} rather than a usable type or a null union,
+        // so the model receives no type constraint for the item. Not introduced by this
+        // PR — `to_json_schema.bal`'s own `oneOf` branch is unreachable because
+        // `getStringRepresentation` panics on unsupported types. Tracked as a follow-up.
+        test:assertTrue(schema.includes("\"items\""), "the array item schema must be present");
+    }
+    if promptText.startsWith("Give me a random joke") {
+        assertSchemaContains(responseJsonSchemaOf(obj), expectedStringResponseSchema(), "string return");
+    }
+    if promptText.startsWith("Evaluate these blogs") {
+        assertSchemaContains(responseJsonSchemaOf(obj), expectedIntArrayResponseSchema(), "int[] return");
+    }
+    if promptText.startsWith("Extract the person") {
+        assertSchemaContains(responseJsonSchemaOf(obj), expectedNestedRecordResponseSchema(),
+                "nested record return");
     }
 
     if promptText.startsWith("Config check") {
@@ -291,7 +376,7 @@ isolated function toolParameters(map<json> payload) returns map<json> {
         json declarations = firstTool["functionDeclarations"];
         if declarations is json[] && declarations.length() > 0 {
             map<json> firstDeclaration = declarations[0] is map<json> ? <map<json>>declarations[0] : {};
-            json params = firstDeclaration["parameters"];
+            json params = firstDeclaration["parametersJsonSchema"];
             return params is map<json> ? params : {};
         }
     }
@@ -316,6 +401,9 @@ isolated function getMockResultText(string message) returns string {
     }
     if message.startsWith("Evaluate") {
         return "{\"result\": [9, 1]}";
+    }
+    if message.startsWith("Nilable array check") {
+        return "{\"result\": [9, null, 1]}";
     }
     if message.startsWith("Rate this blog") {
         return "{\"result\": 4}";
@@ -352,8 +440,16 @@ isolated function buildTextResponse(string text) returns json => {
             index: 0
         }
     ],
-    usageMetadata: {promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15},
-    modelVersion: "gemini-2.5-flash"
+    // Thinking models report reasoning tokens separately from candidate tokens; both are
+    // billed as output.
+    usageMetadata: {
+        promptTokenCount: 10,
+        candidatesTokenCount: 5,
+        thoughtsTokenCount: 40,
+        totalTokenCount: 55
+    },
+    responseId: "resp-abc123",
+    modelVersion: "gemini-2.5-flash-001"
 };
 
 isolated function buildToolCallResponse(string name, map<json> args) returns json => {
