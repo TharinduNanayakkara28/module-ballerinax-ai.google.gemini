@@ -29,3 +29,9 @@ build/
 
 # Ballerina
 target/
+
+# gradle wrapper
+!gradle-wrapper.jar
+
+# mac
+.DS_Store
