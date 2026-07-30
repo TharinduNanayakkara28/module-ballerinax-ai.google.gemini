@@ -72,9 +72,18 @@ public class Native {
             case UnionType unionType -> generateUnionTypeSchema(unionType, schemaGenerationContext);
             case ReferenceType referenceType -> getJsonSchemaFromAnnotatableType(referenceType,
                     schemaGenerationContext);
-            default -> throw ErrorCreator.createError(StringUtils.fromString(
-                    "Runtime schema generation is not yet supported for type " + impliedType.getName()));
+            default -> markNotGeneratedNatively(schemaGenerationContext);
         };
+    }
+
+    /**
+     * Records that this type is outside the natively supported subset and yields no schema.
+     * The caller unwinds to {@code generateJsonSchemaForTypedescNative}, which returns
+     * {@code null} so the Ballerina fallback in {@code to_json_schema.bal} gets a turn.
+     */
+    private static Object markNotGeneratedNatively(SchemaGenerationContext schemaGenerationContext) {
+        schemaGenerationContext.isSchemaGeneratedAtCompileTime = false;
+        return null;
     }
 
     private static BError createAIError(BString message) {
@@ -96,6 +105,9 @@ public class Native {
                 TypeCreator.createArrayType(PredefinedTypes.TYPE_JSON));
         for (Type memberType : memberTypes) {
             Object schema = generateJsonSchemaForType(memberType, schemaGenerationContext);
+            if (!schemaGenerationContext.isSchemaGeneratedAtCompileTime) {
+                return null;
+            }
             schemas.append(schema);
         }
         if (schemas.size() == 1) {
@@ -119,8 +131,7 @@ public class Native {
                 }
             }
         }
-        throw ErrorCreator.createError(StringUtils.fromString(
-                "Runtime schema generation is not yet supported for type: " + referenceType.getName()));
+        return markNotGeneratedNatively(schemaGenerationContext);
     }
 
     private static BMap<BString, Object> generateJsonSchemaForJson() {
@@ -158,15 +169,22 @@ public class Native {
                                                          SchemaGenerationContext schemaGenerationContext) {
         BMap<BString, Object> schemaMap = createMapValue(TypeCreator.createMapType(PredefinedTypes.TYPE_JSON));
         Type elementType = TypeUtils.getImpliedType(arrayType.getElementType());
+        Object itemSchema = generateJsonSchemaForType(elementType, schemaGenerationContext);
+        if (!schemaGenerationContext.isSchemaGeneratedAtCompileTime) {
+            return null;
+        }
         schemaMap.put(StringUtils.fromString("type"), StringUtils.fromString("array"));
-        schemaMap.put(StringUtils.fromString("items"), generateJsonSchemaForType(elementType,
-                schemaGenerationContext));
+        schemaMap.put(StringUtils.fromString("items"), itemSchema);
         return schemaMap;
     }
 
     public static BTypedesc getArrayMemberType(BTypedesc expectedResponseTypedesc) {
-        return ValueCreator.createTypedescValue(
-                ((ArrayType) TypeUtils.getImpliedType(expectedResponseTypedesc.getDescribingType())).getElementType());
+        Type impliedType = TypeUtils.getImpliedType(expectedResponseTypedesc.getDescribingType());
+        if (!(impliedType instanceof ArrayType arrayType)) {
+            throw createAIError(StringUtils.fromString(
+                    "Expected an array type, but found '" + impliedType + "'."));
+        }
+        return ValueCreator.createTypedescValue(arrayType.getElementType());
     }
 
     public static boolean containsNil(BTypedesc expectedResponseTypedesc) {

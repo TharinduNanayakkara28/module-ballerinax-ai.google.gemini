@@ -47,6 +47,11 @@ const reviewRecord = {
     comment: "Covers warm-up, form, equipment, and nutrition."
 };
 
+// Raw JSON for a `Review[]`. An array is not a JSON object, so the structured-output
+// path wraps the value under `result`.
+const reviews = "{\"result\": [{\"rating\": 8, \"comment\": \"Solid warm-up advice.\"}, " +
+    "{\"rating\": 5, \"comment\": \"Thin on nutrition.\"}]}";
+
 type Address record {|
     string city;
     string country;

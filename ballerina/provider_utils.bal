@@ -30,6 +30,7 @@ type ResponseSchema record {|
 # as `inlineData` anyway. Without a cap, a URL taken from prompt data could stream an
 # unbounded body into memory.
 const int MAX_DOCUMENT_DOWNLOAD_SIZE = 20 * 1024 * 1024;
+const int MAX_DOCUMENT_REDIRECTS = 5;
 
 const JSON_CONVERSION_ERROR = "FromJsonStringError";
 const CONVERSION_ERROR = "ConversionError";
@@ -96,8 +97,10 @@ isolated function getExpectedResponseSchema(typedesc<anydata> expectedResponseTy
 # `text` parts and image documents as `inlineData` parts.
 #
 # + prompt - The prompt whose interpolated strings and insertions are converted
+# + allowPrivateHosts - Allows document URLs to resolve to non-public addresses
 # + return - The ordered content parts, or an `ai:Error` for unsupported documents
-isolated function generateChatCreationContent(ai:Prompt prompt) returns Part[]|ai:Error {
+isolated function generateChatCreationContent(ai:Prompt prompt, boolean allowPrivateHosts)
+        returns Part[]|ai:Error {
     string[] & readonly strings = prompt.strings;
     anydata[] insertions = prompt.insertions;
     Part[] parts = [];
@@ -114,12 +117,12 @@ isolated function generateChatCreationContent(ai:Prompt prompt) returns Part[]|a
         if insertion is ai:Document|ai:Chunk {
             addTextPart(accumulatedTextContent, parts);
             accumulatedTextContent = "";
-            check addDocumentPart(insertion, parts);
+            check addDocumentPart(insertion, parts, allowPrivateHosts);
         } else if insertion is (ai:Document|ai:Chunk)[] {
             addTextPart(accumulatedTextContent, parts);
             accumulatedTextContent = "";
             foreach ai:Document|ai:Chunk doc in insertion {
-                check addDocumentPart(doc, parts);
+                check addDocumentPart(doc, parts, allowPrivateHosts);
             }
         } else {
             accumulatedTextContent += insertion.toString();
@@ -131,15 +134,16 @@ isolated function generateChatCreationContent(ai:Prompt prompt) returns Part[]|a
     return parts;
 }
 
-isolated function addDocumentPart(ai:Document|ai:Chunk doc, Part[] parts) returns ai:Error? {
+isolated function addDocumentPart(ai:Document|ai:Chunk doc, Part[] parts, boolean allowPrivateHosts)
+        returns ai:Error? {
     if doc is ai:TextDocument|ai:TextChunk {
         addTextPart(doc.content, parts);
         return;
     } else if doc is ai:ImageDocument {
-        parts.push(check buildImagePart(doc));
+        parts.push(check buildImagePart(doc, allowPrivateHosts));
         return;
     } else if doc is ai:FileDocument {
-        parts.push(check buildFilePart(doc));
+        parts.push(check buildFilePart(doc, allowPrivateHosts));
         return;
     }
     return error ai:Error("Only text, image and file documents are supported.");
@@ -152,8 +156,9 @@ isolated function addDocumentPart(ai:Document|ai:Chunk doc, Part[] parts) return
 # `Content-Type` for URLs.
 #
 # + doc - The file document
+# + allowPrivateHosts - Allows a document URL to resolve to a non-public address
 # + return - The corresponding part, or an `ai:Error` on failure
-isolated function buildFilePart(ai:FileDocument doc) returns Part|ai:Error {
+isolated function buildFilePart(ai:FileDocument doc, boolean allowPrivateHosts) returns Part|ai:Error {
     byte[]|ai:Url|ai:FileId content = doc.content;
     if content is ai:FileId {
         FileData fileData = {fileUri: content.fileId};
@@ -164,7 +169,7 @@ isolated function buildFilePart(ai:FileDocument doc) returns Part|ai:Error {
         return {fileData};
     }
     if content is ai:Url {
-        [byte[], string?] downloaded = check downloadDocument(content);
+        [byte[], string?] downloaded = check downloadDocument(content, allowPrivateHosts);
         string? mimeType = doc.metadata?.mimeType ?: downloaded[1];
         if mimeType is () {
             return error ai:Error("A concrete file MIME type is required for Gemini; none was provided in " +
@@ -193,12 +198,13 @@ isolated function addTextPart(string content, Part[] parts) {
 # wildcard like `image/*`.
 #
 # + doc - The image document
+# + allowPrivateHosts - Allows a document URL to resolve to a non-public address
 # + return - The image part, or an `ai:Error` when the MIME type cannot be
 #            determined or the download fails
-isolated function buildImagePart(ai:ImageDocument doc) returns Part|ai:Error {
+isolated function buildImagePart(ai:ImageDocument doc, boolean allowPrivateHosts) returns Part|ai:Error {
     ai:Url|byte[] content = doc.content;
     if content is ai:Url {
-        [byte[], string?] downloaded = check downloadDocument(content);
+        [byte[], string?] downloaded = check downloadDocument(content, allowPrivateHosts);
         string? mimeType = doc.metadata?.mimeType ?: downloaded[1];
         if mimeType is () {
             return error ai:Error("A concrete image MIME type is required for Gemini; none was provided in " +
@@ -216,45 +222,207 @@ isolated function buildImagePart(ai:ImageDocument doc) returns Part|ai:Error {
 
 # Downloads the bytes at `url` and returns them together with the response MIME
 # type. Gemini cannot fetch arbitrary web URLs itself, so image/file URLs are
-# fetched by the connector and sent inline. Redirects are followed.
+# fetched by the connector and sent inline.
+#
+# Redirects are followed manually rather than by the HTTP client, so that every hop
+# is checked against `validateDownloadDestination`. Letting the client follow them
+# automatically would allow a public origin to bounce the request to an internal
+# address after the initial check had already passed.
 #
 # + url - The URL to fetch
+# + allowPrivateHosts - Skips the non-public destination check when `true`
 # + return - The downloaded bytes and the response MIME type (`Content-Type`
 #            without parameters, `()` when absent), or an `ai:Error` on failure
-isolated function downloadDocument(ai:Url url) returns [byte[], string?]|ai:Error {
-    [string, string] originPath = check splitUrl(url);
-    http:Client|error downloadClient = new (originPath[0], {followRedirects: {enabled: true, maxCount: 5}});
-    if downloadClient is error {
-        return error ai:Error(string `Failed to create a client to download the document from '${url}'.`, downloadClient);
-    }
-    http:Response|error response = downloadClient->get(originPath[1]);
-    if response is error {
-        return error ai:Error(string `Failed to download the document from '${url}'.`, response);
-    }
-    if response.statusCode < 200 || response.statusCode >= 300 {
-        return error ai:Error(string `Failed to download the document from '${url}': status ${response.statusCode}.`);
-    }
-    // The URL comes from caller-supplied prompt data, so this is an outbound fetch to an
-    // address the connector does not control. Reject an oversized body before reading it
-    // where the server declares its length, and again afterwards as a backstop for
-    // chunked responses that declare none.
-    string|error declaredLength = response.getHeader("Content-Length");
-    if declaredLength is string {
-        int|error contentLength = int:fromString(declaredLength);
-        if contentLength is int && contentLength > MAX_DOCUMENT_DOWNLOAD_SIZE {
-            return error ai:Error(string `The document at '${url}' is ${contentLength} bytes, which exceeds the ${
+isolated function downloadDocument(ai:Url url, boolean allowPrivateHosts) returns [byte[], string?]|ai:Error {
+    string currentUrl = url;
+    foreach int hop in 0 ... MAX_DOCUMENT_REDIRECTS {
+        [string, string] originPath = check splitUrl(currentUrl);
+        check validateDownloadDestination(originPath[0], allowPrivateHosts);
+        http:Client|error downloadClient = new (originPath[0], {followRedirects: {enabled: false}});
+        if downloadClient is error {
+            return error ai:Error(string `Failed to create a client to download the document from '${url}'.`,
+                    downloadClient);
+        }
+        http:Response|error response = downloadClient->get(originPath[1]);
+        if response is error {
+            return error ai:Error(string `Failed to download the document from '${url}'.`, response);
+        }
+
+        if isRedirectStatus(response.statusCode) {
+            if hop == MAX_DOCUMENT_REDIRECTS {
+                return error ai:Error(string `Too many redirects (more than ${MAX_DOCUMENT_REDIRECTS}) while ` +
+                        string `downloading the document from '${url}'.`);
+            }
+            string|error location = response.getHeader("Location");
+            if location is error {
+                return error ai:Error(string `The document at '${url}' returned a ${response.statusCode} ` +
+                        "redirect with no 'Location' header.");
+            }
+            currentUrl = resolveRedirectTarget(originPath[0], location);
+            continue;
+        }
+
+        if response.statusCode < 200 || response.statusCode >= 300 {
+            return error ai:Error(string `Failed to download the document from '${url}': status ${
+                response.statusCode}.`);
+        }
+        // The URL comes from caller-supplied prompt data, so this is an outbound fetch to an
+        // address the connector does not control. Reject an oversized body before reading it
+        // where the server declares its length, and again afterwards as a backstop for
+        // chunked responses that declare none.
+        string|error declaredLength = response.getHeader("Content-Length");
+        if declaredLength is string {
+            int|error contentLength = int:fromString(declaredLength);
+            if contentLength is int && contentLength > MAX_DOCUMENT_DOWNLOAD_SIZE {
+                return error ai:Error(string `The document at '${url}' is ${contentLength} bytes, which exceeds the ${
+                    MAX_DOCUMENT_DOWNLOAD_SIZE} byte limit.`);
+            }
+        }
+        byte[]|error payload = response.getBinaryPayload();
+        if payload is error {
+            return error ai:Error(string `Failed to read the downloaded document from '${url}'.`, payload);
+        }
+        if payload.length() > MAX_DOCUMENT_DOWNLOAD_SIZE {
+            return error ai:Error(string `The document at '${url}' is ${payload.length()} bytes, which exceeds the ${
                 MAX_DOCUMENT_DOWNLOAD_SIZE} byte limit.`);
         }
+        return [payload, normalizeMimeType(response.getContentType())];
     }
-    byte[]|error payload = response.getBinaryPayload();
-    if payload is error {
-        return error ai:Error(string `Failed to read the downloaded document from '${url}'.`, payload);
+    return error ai:Error(string `Too many redirects while downloading the document from '${url}'.`);
+}
+
+isolated function isRedirectStatus(int statusCode) returns boolean =>
+    statusCode == 301 || statusCode == 302 || statusCode == 303 || statusCode == 307 || statusCode == 308;
+
+# Resolves a `Location` header against the origin it was served from. An absolute URL is
+# taken as-is; a root-relative or relative reference is resolved against the origin.
+#
+# + origin - The origin (`scheme://host[:port]`) that issued the redirect
+# + location - The raw `Location` header value
+# + return - The absolute URL of the redirect target
+isolated function resolveRedirectTarget(string origin, string location) returns string {
+    string lowered = location.toLowerAscii();
+    if lowered.startsWith("http://") || lowered.startsWith("https://") {
+        return location;
     }
-    if payload.length() > MAX_DOCUMENT_DOWNLOAD_SIZE {
-        return error ai:Error(string `The document at '${url}' is ${payload.length()} bytes, which exceeds the ${
-            MAX_DOCUMENT_DOWNLOAD_SIZE} byte limit.`);
+    return location.startsWith("/") ? origin + location : origin + "/" + location;
+}
+
+# Rejects a download destination that the connector must not reach.
+#
+# Only `http` and `https` are permitted. Unless `allowPrivateHosts` is set, a host that
+# is a literal loopback, private, link-local, carrier-grade-NAT or unspecified address
+# is rejected, as is `localhost`.
+#
+# Note this checks the literal host in the URL. A public DNS name that resolves to an
+# internal address is not detected, because resolving it here and connecting separately
+# would still leave a TOCTOU gap. Deployments handling genuinely untrusted URLs should
+# pair this with an egress policy at the network layer.
+#
+# + origin - The origin (`scheme://host[:port]`) to check
+# + allowPrivateHosts - Skips the non-public destination check when `true`
+# + return - `()` when the destination is permitted, otherwise an `ai:Error`
+isolated function validateDownloadDestination(string origin, boolean allowPrivateHosts) returns ai:Error? {
+    string lowered = origin.toLowerAscii();
+    if !lowered.startsWith("http://") && !lowered.startsWith("https://") {
+        return error ai:Error(string `Only 'http' and 'https' document URLs are supported, got '${origin}'.`);
     }
-    return [payload, normalizeMimeType(response.getContentType())];
+    if allowPrivateHosts {
+        return;
+    }
+    string host = extractHost(lowered);
+    if isNonPublicHost(host) {
+        return error ai:Error(string `Refusing to download a document from '${host}', which is not a public ` +
+                "address. Set 'allowPrivateDocumentHosts' to true if documents are served from a trusted " +
+                "internal host.");
+    }
+    return;
+}
+
+# Extracts the host from a lowercased origin, dropping the scheme, any port, and the
+# brackets around an IPv6 literal.
+#
+# + origin - The lowercased origin (`scheme://host[:port]`)
+# + return - The bare host
+isolated function extractHost(string origin) returns string {
+    int? schemeIdx = origin.indexOf("://");
+    string hostPort = schemeIdx is int ? origin.substring(schemeIdx + 3) : origin;
+    if hostPort.startsWith("[") {
+        int? closing = hostPort.indexOf("]");
+        return closing is int ? hostPort.substring(1, closing) : hostPort.substring(1);
+    }
+    int? portIdx = hostPort.indexOf(":");
+    return portIdx is int ? hostPort.substring(0, portIdx) : hostPort;
+}
+
+# Reports whether a literal host is a loopback, private, link-local, CGNAT or
+# unspecified address, or a `localhost` name.
+#
+# + host - The bare lowercased host
+# + return - `true` when the host must not be reached
+isolated function isNonPublicHost(string host) returns boolean {
+    if host == "localhost" || host.endsWith(".localhost") || host.length() == 0 {
+        return true;
+    }
+    int[]? octets = parseIpv4(host);
+    if octets is int[] {
+        return isNonPublicIpv4(octets);
+    }
+    if host.includes(":") {
+        // IPv6 literal. `::ffff:a.b.c.d` maps an IPv4 address into v6 space, so the
+        // embedded address is checked with the same rules rather than being let through.
+        int? lastColon = host.lastIndexOf(":");
+        if lastColon is int {
+            int[]? mapped = parseIpv4(host.substring(lastColon + 1));
+            if mapped is int[] {
+                return isNonPublicIpv4(mapped);
+            }
+        }
+        if host == "::1" || host == "::" {
+            return true;
+        }
+        // fc00::/7 (unique local) and fe80::/10 (link-local).
+        return host.startsWith("fc") || host.startsWith("fd")
+            || host.startsWith("fe8") || host.startsWith("fe9")
+            || host.startsWith("fea") || host.startsWith("feb");
+    }
+    return false;
+}
+
+isolated function isNonPublicIpv4(int[] octets) returns boolean {
+    int first = octets[0];
+    int second = octets[1];
+    // 0.0.0.0/8 unspecified, 127/8 loopback, 10/8 + 172.16/12 + 192.168/16 private,
+    // 169.254/16 link-local, 100.64/10 carrier-grade NAT, 192.0.0/24 IETF protocol.
+    return first == 0 || first == 127 || first == 10
+        || (first == 172 && second >= 16 && second <= 31)
+        || (first == 192 && second == 168)
+        || (first == 169 && second == 254)
+        || (first == 100 && second >= 64 && second <= 127)
+        || (first == 192 && second == 0 && octets[2] == 0);
+}
+
+# Parses a dotted-quad IPv4 literal.
+#
+# + host - The host to parse
+# + return - The four octets, or `()` when `host` is not an IPv4 literal
+isolated function parseIpv4(string host) returns int[]? {
+    string[] parts = re `\.`.split(host);
+    if parts.length() != 4 {
+        return ();
+    }
+    int[] octets = [];
+    foreach string part in parts {
+        if part.length() == 0 || part.length() > 3 {
+            return ();
+        }
+        int|error octet = int:fromString(part);
+        if octet is error || octet < 0 || octet > 255 {
+            return ();
+        }
+        octets.push(octet);
+    }
+    return octets;
 }
 
 # Splits a URL into its origin (`scheme://host[:port]`) and the resource path
@@ -526,19 +694,20 @@ isolated function extractTextFromCandidate(Candidate candidate) returns string? 
 #                 from the request when `()` so the model's own default applies
 # + maxTokens - The upper limit for the number of tokens in the generated response
 # + thinkingBudget - Token budget for internal reasoning; omitted when `()`
+# + allowPrivateDocumentHosts - Allows document URLs to resolve to non-public addresses
 # + prompt - The prompt to send
 # + expectedResponseTypedesc - The caller's expected return type
 # + return - The generated value bound to the expected type, or an `ai:Error`
 isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEMINI_MODEL_NAMES modelType,
-        decimal? temperature, int maxTokens, int? thinkingBudget, ai:Prompt prompt,
-        typedesc<json> expectedResponseTypedesc) returns anydata|ai:Error {
+        decimal? temperature, int maxTokens, int? thinkingBudget, boolean allowPrivateDocumentHosts,
+        ai:Prompt prompt, typedesc<json> expectedResponseTypedesc) returns anydata|ai:Error {
     observe:GenerateContentSpan span = observe:createGenerateContentSpan(modelType);
     span.addProvider("gemini");
 
     Part[] parts;
     ResponseSchema responseSchema;
     do {
-        parts = check generateChatCreationContent(prompt);
+        parts = check generateChatCreationContent(prompt, allowPrivateDocumentHosts);
         responseSchema = check getExpectedResponseSchema(expectedResponseTypedesc);
     } on fail ai:Error err {
         span.close(err);

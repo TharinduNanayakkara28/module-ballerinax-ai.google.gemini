@@ -62,6 +62,7 @@ public isolated distinct client class ModelProvider {
     private final decimal? temperature;
     private final int maxTokens;
     private final int? thinkingBudget;
+    private final boolean allowPrivateDocumentHosts;
 
     # Initializes the Gemini model with the given connection configuration and model configuration.
     #
@@ -78,6 +79,13 @@ public isolated distinct client class ModelProvider {
     #                    thinking on models that permit it, `-1` lets the model choose
     #                    dynamically. Left unset when `()`. Thinking tokens are billed against
     #                    `maxTokens`
+    # + allowPrivateDocumentHosts - Allows document URLs in a prompt to resolve to loopback,
+    #                               private, link-local or otherwise non-public addresses.
+    #                               Gemini cannot fetch URLs itself, so the connector downloads
+    #                               them; when `false` (the default) such destinations are
+    #                               rejected, so a URL reaching the connector from an untrusted
+    #                               source cannot be used to probe internal services. Enable
+    #                               only when documents are served from a trusted internal host
     # + connectionConfig - Additional HTTP connection configuration
     # + return - `()` on successful initialization; otherwise, returns an `ai:Error`
     public isolated function init(@display {label: "API Key"} string apiKey,
@@ -86,6 +94,7 @@ public isolated distinct client class ModelProvider {
             @display {label: "Maximum Tokens"} int maxTokens = DEFAULT_MAX_TOKEN_COUNT,
             @display {label: "Temperature"} decimal? temperature = (),
             @display {label: "Thinking Budget"} int? thinkingBudget = (),
+            @display {label: "Allow Private Document Hosts"} boolean allowPrivateDocumentHosts = false,
             @display {label: "Connection Configuration"} *ConnectionConfig connectionConfig) returns ai:Error? {
         // `ConnectionConfig` is a field-compatible subset of `http:ClientConfiguration`
         // (it omits `auth` because Gemini authenticates via the `x-goog-api-key`
@@ -100,6 +109,7 @@ public isolated distinct client class ModelProvider {
         self.temperature = temperature;
         self.maxTokens = maxTokens;
         self.thinkingBudget = thinkingBudget;
+        self.allowPrivateDocumentHosts = allowPrivateDocumentHosts;
     }
 
     # Sends a chat request to the Gemini model with the given messages and tools.
@@ -446,7 +456,14 @@ isolated function getChatMessageStringContent(ai:Prompt|string prompt) returns s
 
 isolated function convertMessageToJson(ai:ChatMessage[]|ai:ChatMessage messages) returns json|ai:Error {
     if messages is ai:ChatMessage[] {
-        return messages.'map(msg => msg is ai:ChatUserMessage|ai:ChatSystemMessage ? check convertMessageToJson(msg) : msg);
+        // An explicit loop, not `.'map`: `lang.array:map` has no error in its inferred
+        // member type, so a `check` failing inside the lambda panics instead of
+        // returning the `ai:Error` this function declares.
+        json[] converted = [];
+        foreach ai:ChatMessage message in messages {
+            converted.push(check convertMessageToJson(message));
+        }
+        return converted;
     }
     return messages !is ai:ChatUserMessage|ai:ChatSystemMessage ? messages :
         {role: messages.role, content: check getChatMessageStringContent(messages.content), name: messages.name};

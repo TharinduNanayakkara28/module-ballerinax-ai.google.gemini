@@ -108,6 +108,16 @@ service /llm on new http:Listener(8080) {
         response.setBinaryPayload(sampleBinaryData, mimeType);
         return response;
     }
+
+    // Redirects to the asset above, so the connector's manual redirect loop is
+    // exercised. The HTTP client no longer auto-follows redirects (each hop must be
+    // revalidated), so a broken loop shows up here as a failed download.
+    resource function get redirect/[string name]() returns http:Response {
+        http:Response response = new;
+        response.statusCode = 302;
+        response.setHeader("Location", string `/llm/assets/${name}`);
+        return response;
+    }
 }
 
 // Asserts the shape of a `:generateContent` request for the scenarios that
@@ -410,6 +420,9 @@ isolated function getMockResultText(string message) returns string {
     }
     if message.startsWith("Please rate this blog") {
         return review;
+    }
+    if message.startsWith("List the reviews") {
+        return reviews;
     }
     if message.startsWith("Extract the person") {
         return personJson;

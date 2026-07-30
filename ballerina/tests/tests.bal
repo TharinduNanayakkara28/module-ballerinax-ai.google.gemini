@@ -23,8 +23,14 @@ const UNSUPPORTED_DOC_ERROR = "Only text, image and file documents are supported
 // Served by the mock asset endpoint so the URL-download path can be exercised.
 const IMAGE_URL = "http://localhost:8080/llm/assets/sample.png";
 const PDF_URL = "http://localhost:8080/llm/assets/sample.pdf";
+// 302s to IMAGE_URL, for the manual redirect loop.
+const REDIRECT_IMAGE_URL = "http://localhost:8080/llm/redirect/sample.png";
 
-final ModelProvider provider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL);
+// The mock serves document assets from loopback, which the connector rejects by default.
+final ModelProvider provider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL,
+        allowPrivateDocumentHosts = true);
+// Left at the default so the destination check itself can be exercised.
+final ModelProvider strictProvider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL);
 final EmbeddingProvider embeddingProvider = check new (API_KEY, GEMINI_EMBEDDING_2, SERVICE_URL);
 
 // ── chat ───────────────────────────────────────────────────────────────────
@@ -33,6 +39,20 @@ final EmbeddingProvider embeddingProvider = check new (API_KEY, GEMINI_EMBEDDING
 function testChatWithTextResponse() returns ai:Error? {
     ai:ChatAssistantMessage result = check provider->chat([{role: ai:USER, content: "Say hello"}], []);
     test:assertEquals(result.content, "Hello there!");
+}
+
+@test:Config
+function testChatWithNonTextDocumentReturnsError() {
+    // README: "passing a non-text `ai:Document` to `chat` returns an error". This must be
+    // a returned `ai:Error`, not a panic — the telemetry conversion in `chat` runs before
+    // the request is built, so an error escaping it as a panic would crash the caller.
+    ai:ImageDocument image = {content: sampleBinaryData, metadata: {mimeType: "image/png"}};
+    ai:ChatAssistantMessage|ai:Error result = provider->chat([
+        {role: ai:USER, content: "Say hello"},
+        {role: ai:USER, content: `describe ${image}`}
+    ], []);
+    test:assertTrue(result is ai:Error, "expected an ai:Error for a non-text document in chat");
+    test:assertEquals((<ai:Error>result).message(), "Only Text Documents are currently supported.");
 }
 
 @test:Config
@@ -309,6 +329,19 @@ function testGenerateRecordReturnType() returns error? {
 }
 
 @test:Config
+function testGenerateRecordArrayReturnType() returns error? {
+    // `Review` carries the compiler-plugin-generated `@ai:JsonSchema` annotation, but
+    // `Review[]` does not, so the annotation lookup in `generateJsonSchemaForTypedescAsJson`
+    // misses and schema generation falls through to the native path. That path must still
+    // resolve the annotation on the array's element type.
+    Review[] reviews = check provider->generate(`List the reviews for this blog`);
+    test:assertEquals(reviews, [
+        {rating: 8, comment: "Solid warm-up advice."},
+        {rating: 5, comment: "Thin on nutrition."}
+    ]);
+}
+
+@test:Config
 function testGenerateStringReturnType() returns error? {
     string joke = check provider->generate(`Give me a random joke`);
     test:assertEquals(joke, "Why did the chicken cross the road?");
@@ -402,6 +435,59 @@ function testGenerateWithImageUrl() returns ai:Error? {
     ai:ImageDocument img = {content: IMAGE_URL};
     string description = check provider->generate(`Describe the image at the URL. ${img}.`);
     test:assertEquals(description, "This is a sample image description.");
+}
+
+@test:Config
+function testGenerateRejectsLoopbackDocumentUrlByDefault() {
+    // Same URL the permissive provider downloads happily; the default provider must
+    // refuse it so a URL arriving from an untrusted source cannot probe internal services.
+    ai:ImageDocument img = {content: IMAGE_URL};
+    string|ai:Error description = strictProvider->generate(`Describe the image at the URL. ${img}.`);
+    test:assertTrue(description is ai:Error, "a loopback document URL must be rejected by default");
+    test:assertTrue((<ai:Error>description).message().includes("not a public address"),
+            "expected the non-public destination error, got: " + (<ai:Error>description).message());
+}
+
+@test:Config
+function testGenerateRejectsNonHttpDocumentUrl() {
+    ai:ImageDocument img = {content: "file:///etc/passwd"};
+    string|ai:Error description = strictProvider->generate(`Describe the image at the URL. ${img}.`);
+    test:assertTrue(description is ai:Error, "a non-HTTP document URL must be rejected");
+    test:assertTrue((<ai:Error>description).message().includes("Only 'http' and 'https'"),
+            "expected the scheme error, got: " + (<ai:Error>description).message());
+}
+
+@test:Config
+function testGenerateFollowsDocumentRedirect() returns ai:Error? {
+    // Redirects are now followed by hand rather than by the HTTP client, so that each hop
+    // can be revalidated. This covers that loop still resolving a 302 to the real asset.
+    // The per-hop *rejection* can only be unit-tested (see testNonPublicHostDetection):
+    // the mock is itself on loopback, so an end-to-end redirect into a private address
+    // would be blocked on the first hop and prove nothing about the second.
+    ai:ImageDocument img = {content: REDIRECT_IMAGE_URL};
+    string description = check provider->generate(`Describe the image at the URL. ${img}.`);
+    test:assertEquals(description, "This is a sample image description.");
+}
+
+@test:Config
+function testNonPublicHostDetection() {
+    // Table-check the address classifier directly; the ranges are easy to get subtly wrong.
+    string[] blocked = [
+        "localhost", "app.localhost", "127.0.0.1", "127.1.2.3", "10.0.0.5", "172.16.0.1",
+        "172.31.255.254", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
+        "192.0.0.1", "::1", "::", "fc00::1", "fd12:3456::1", "fe80::1", "::ffff:127.0.0.1"
+    ];
+    foreach string host in blocked {
+        test:assertTrue(isNonPublicHost(host), string `'${host}' must be treated as non-public`);
+    }
+
+    string[] allowed = [
+        "example.com", "8.8.8.8", "1.1.1.1", "172.32.0.1", "172.15.0.1", "192.169.0.1",
+        "169.253.0.1", "100.128.0.1", "2606:4700::1111", "storage.googleapis.com"
+    ];
+    foreach string host in allowed {
+        test:assertFalse(isNonPublicHost(host), string `'${host}' must be treated as public`);
+    }
 }
 
 @test:Config
