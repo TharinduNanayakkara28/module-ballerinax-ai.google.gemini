@@ -82,7 +82,10 @@ class GenerateMethodModificationTask implements ModifierTask<SourceModifierConte
     private static final String BALLERINA_ORG_NAME = "ballerina";
     private static final String GEMINI_MODEL_PROVIDER_NAME = "ModelProvider";
     private static final String GEMINI_MODEL_PROVIDER_MODULE_NAME = "ai.google.gemini";
-    private static final String GEMINI_MODEL_PROVIDER_MODULE_VERSION = "1";
+    // This package's MAJOR version, used to resolve the Gemini `ModelProvider` symbol. It must
+    // be updated whenever the major version in gradle.properties changes; otherwise the symbol
+    // does not resolve and `generate()` calls silently lose their `@ai:JsonSchema` injection.
+    private static final String GEMINI_MODEL_PROVIDER_MODULE_VERSION = "0";
     private static final String GEMINI_MODEL_PROVIDER_MODULE_ORG = "ballerinax";
     private final AiGeminiCodeModifier.AnalysisData analysisData;
     private final ModifierData modifierData;
