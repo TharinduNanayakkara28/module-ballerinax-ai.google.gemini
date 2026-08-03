@@ -10,7 +10,6 @@ The `ai.google.gemini` connector plugs Gemini into the Ballerina [`ai`](https://
 - Native tool/function calling
 - Structured output via Gemini's native JSON mode (`responseJsonSchema`)
 - Multimodal input — images, PDFs, and Gemini File API references, through `generate`
-- Configurable reasoning budget for thinking models (`thinkingBudget`)
 - Text and embedding model support (`embed` / `batchEmbed`)
 - Secure communication using API-key authentication
 
@@ -19,7 +18,7 @@ The `ai.google.gemini` connector plugs Gemini into the Ballerina [`ai`](https://
 - **`chat` accepts text only.** Images, PDFs, and other documents are supported through `generate` (see [Multimodal input](#multimodal-input)); passing a non-text `ai:Document` to `chat` returns an error.
 - **Streaming is not available.** The `ai:ModelProvider` interface defines only `chat` and `generate`, so there is no streaming API to implement.
 - **Gemini Developer API only.** Vertex AI endpoints (`{location}-aiplatform.googleapis.com`, OAuth bearer credentials, `publishers/google/models/...` paths) are not supported.
-- **Document URLs are fetched by the connector.** Gemini cannot fetch arbitrary web URLs, so an `ai:Url` in a prompt is downloaded locally and sent inline. Only `http` and `https` are accepted, and destinations that are loopback, private, link-local, carrier-grade-NAT or unspecified addresses are rejected — on the initial request and again on every redirect. Set `allowPrivateDocumentHosts` to `true` when documents are served from a trusted internal host. Note the check applies to the literal host in the URL: a public DNS name that resolves to an internal address is not detected, so deployments handling untrusted URLs should also enforce an egress policy at the network layer.
+- **Document URLs are fetched by the connector.** Gemini cannot fetch arbitrary web URLs, so an `ai:Url` in a prompt is downloaded locally and sent inline. Only `http` and `https` are accepted. Internal destinations (loopback, private, link-local, carrier-grade-NAT) are permitted by default, so documents served from an internal host work out of the box. If document URLs may come from an untrusted source, set `allowPrivateDocumentHosts` to `false` — the connector then rejects those destinations on the initial request and on every redirect. Note the check applies to the literal host in the URL: a public DNS name that resolves to an internal address is not detected, so deployments handling untrusted URLs should also enforce an egress policy at the network layer.
 
 ## Prerequisites
 
@@ -111,7 +110,7 @@ For embeddings, `GEMINI_EMBEDDING_2` is the current model. `GEMINI_EMBEDDING_001
 
 Gemini 2.5 models and later perform internal reasoning by default, and **reasoning tokens are billed against `maxOutputTokens`**. A small token cap can therefore be consumed entirely by reasoning, returning a response with `finishReason` `MAX_TOKENS` and no text at all.
 
-`maxTokens` defaults to 65,536 — the models' own maximum output limit — so this does not happen out of the box. It is a ceiling, not a target: billing follows the tokens actually produced. Use `thinkingBudget` to bound reasoning explicitly (`0` disables thinking where the model permits it, `-1` lets the model decide).
+`maxTokens` defaults to 65,536 — the models' own maximum output limit — so this does not happen out of the box. It is a ceiling, not a target: billing follows the tokens actually produced.
 
 ### Temperature
 

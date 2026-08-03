@@ -649,8 +649,7 @@ isolated function buildUnusableCandidateMessage(Candidate candidate,
         message += string ` (finishReason: ${finishReason})`;
         if finishReason == "MAX_TOKENS" {
             message += "; generation was truncated before any text was produced. Thinking " +
-                "tokens count towards 'maxTokens', so raising 'maxTokens' or lowering " +
-                "'thinkingBudget' may resolve this";
+                "tokens count towards 'maxTokens', so raising 'maxTokens' may resolve this";
         }
     }
     PromptFeedback? feedback = response.promptFeedback;
@@ -693,13 +692,12 @@ isolated function extractTextFromCandidate(Candidate candidate) returns string? 
 # + temperature - The temperature for controlling randomness in the model's output; omitted
 #                 from the request when `()` so the model's own default applies
 # + maxTokens - The upper limit for the number of tokens in the generated response
-# + thinkingBudget - Token budget for internal reasoning; omitted when `()`
 # + allowPrivateDocumentHosts - Allows document URLs to resolve to non-public addresses
 # + prompt - The prompt to send
 # + expectedResponseTypedesc - The caller's expected return type
 # + return - The generated value bound to the expected type, or an `ai:Error`
 isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEMINI_MODEL_NAMES modelType,
-        decimal? temperature, int maxTokens, int? thinkingBudget, boolean allowPrivateDocumentHosts,
+        decimal? temperature, int maxTokens, boolean allowPrivateDocumentHosts,
         ai:Prompt prompt, typedesc<json> expectedResponseTypedesc) returns anydata|ai:Error {
     observe:GenerateContentSpan span = observe:createGenerateContentSpan(modelType);
     span.addProvider("gemini");
@@ -729,9 +727,6 @@ isolated function generateLlmResponse(http:Client httpClient, string apiKey, GEM
     };
     if temperature is decimal {
         generationConfig.temperature = temperature;
-    }
-    if thinkingBudget is int {
-        generationConfig.thinkingConfig = {thinkingBudget};
     }
     GenerateContentRequest request = {
         contents: [{role: GEMINI_ROLE_USER, parts}],

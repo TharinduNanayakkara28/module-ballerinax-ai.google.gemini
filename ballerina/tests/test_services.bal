@@ -265,7 +265,7 @@ function validateGenerateContentRequest(string promptText, json payload) {
         test:assertFalse(genConfig.hasKey("temperature"),
                 "temperature must be omitted from generate() when unset");
         test:assertFalse(genConfig.hasKey("thinkingConfig"),
-                "thinkingConfig must be omitted from generate() when thinkingBudget is unset");
+                "thinkingConfig must never be sent; the connector does not expose a thinking budget");
         test:assertEquals(genConfig["maxOutputTokens"], DEFAULT_MAX_TOKEN_COUNT,
                 "maxTokens must be forwarded to generate()");
         test:assertEquals(genConfig["responseMimeType"], "application/json");

@@ -26,11 +26,11 @@ const PDF_URL = "http://localhost:8080/llm/assets/sample.pdf";
 // 302s to IMAGE_URL, for the manual redirect loop.
 const REDIRECT_IMAGE_URL = "http://localhost:8080/llm/redirect/sample.png";
 
-// The mock serves document assets from loopback, which the connector rejects by default.
-final ModelProvider provider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL,
-        allowPrivateDocumentHosts = true);
-// Left at the default so the destination check itself can be exercised.
-final ModelProvider strictProvider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL);
+// The mock serves document assets from loopback, which the default (`true`) permits.
+final ModelProvider provider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL);
+// Opted out, so the destination check itself can be exercised.
+final ModelProvider strictProvider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL,
+        allowPrivateDocumentHosts = false);
 final EmbeddingProvider embeddingProvider = check new (API_KEY, GEMINI_EMBEDDING_2, SERVICE_URL);
 
 // ── chat ───────────────────────────────────────────────────────────────────
@@ -155,7 +155,7 @@ function testChatTruncatedByThinkingReturnsError() returns error? {
             "a candidate with no usable content must surface as ai:LlmInvalidResponseError");
     string message = (<ai:Error>result).message();
     test:assertTrue(message.includes("MAX_TOKENS"), "the error must name the finishReason");
-    test:assertTrue(message.includes("thinkingBudget"),
+    test:assertTrue(message.includes("maxTokens"),
             "the error should point at the thinking-token cause");
 }
 
@@ -438,12 +438,13 @@ function testGenerateWithImageUrl() returns ai:Error? {
 }
 
 @test:Config
-function testGenerateRejectsLoopbackDocumentUrlByDefault() {
-    // Same URL the permissive provider downloads happily; the default provider must
-    // refuse it so a URL arriving from an untrusted source cannot probe internal services.
+function testGenerateRejectsLoopbackDocumentUrlWhenOptedOut() {
+    // Same URL the default provider downloads happily; a provider constructed with
+    // `allowPrivateDocumentHosts = false` must refuse it, so a URL arriving from an
+    // untrusted source cannot be used to probe internal services.
     ai:ImageDocument img = {content: IMAGE_URL};
     string|ai:Error description = strictProvider->generate(`Describe the image at the URL. ${img}.`);
-    test:assertTrue(description is ai:Error, "a loopback document URL must be rejected by default");
+    test:assertTrue(description is ai:Error, "a loopback document URL must be rejected when opted out");
     test:assertTrue((<ai:Error>description).message().includes("not a public address"),
             "expected the non-public destination error, got: " + (<ai:Error>description).message());
 }

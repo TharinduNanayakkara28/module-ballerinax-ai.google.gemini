@@ -240,20 +240,6 @@ type ToolConfig record {|
     FunctionCallingConfig functionCallingConfig?;
 |};
 
-# Controls the model's internal reasoning ("thinking").
-#
-# Gemini 2.5 models and later think by default, and thinking tokens are billed against
-# `maxOutputTokens`. A small `maxOutputTokens` can therefore be consumed entirely by
-# reasoning, yielding a candidate with `finishReason` "MAX_TOKENS" and no text part.
-type ThinkingConfig record {|
-    # Token budget the model may spend on internal reasoning. `0` disables thinking on
-    # models that permit it; `-1` lets the model choose its own budget dynamically.
-    # Omitted entirely when unset, so the model's default applies.
-    int thinkingBudget?;
-    # Whether thought summaries are included in the response parts
-    boolean includeThoughts?;
-|};
-
 # Generation parameters controlling sampling and output shape.
 type GenerationConfig record {|
     # Sampling temperature
@@ -274,9 +260,6 @@ type GenerationConfig record {|
     # still required. Mutually exclusive with `responseSchema` — Gemini rejects requests
     # that set both.
     map<json> responseJsonSchema?;
-    # Internal-reasoning configuration. Omitted when unset, so the model's default
-    # thinking behaviour applies.
-    ThinkingConfig thinkingConfig?;
 |};
 
 # A single safety category/threshold pairing.

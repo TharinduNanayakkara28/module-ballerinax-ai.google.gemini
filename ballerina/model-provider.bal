@@ -61,7 +61,6 @@ public isolated distinct client class ModelProvider {
     private final GEMINI_MODEL_NAMES modelType;
     private final decimal? temperature;
     private final int maxTokens;
-    private final int? thinkingBudget;
     private final boolean allowPrivateDocumentHosts;
 
     # Initializes the Gemini model with the given connection configuration and model configuration.
@@ -75,17 +74,13 @@ public isolated distinct client class ModelProvider {
     #                 recommends leaving this unset for Gemini 3 models: values below the
     #                 default of `1.0` may cause looping or degraded performance on complex
     #                 reasoning tasks
-    # + thinkingBudget - Token budget the model may spend on internal reasoning. `0` disables
-    #                    thinking on models that permit it, `-1` lets the model choose
-    #                    dynamically. Left unset when `()`. Thinking tokens are billed against
-    #                    `maxTokens`
     # + allowPrivateDocumentHosts - Allows document URLs in a prompt to resolve to loopback,
     #                               private, link-local or otherwise non-public addresses.
-    #                               Gemini cannot fetch URLs itself, so the connector downloads
-    #                               them; when `false` (the default) such destinations are
-    #                               rejected, so a URL reaching the connector from an untrusted
-    #                               source cannot be used to probe internal services. Enable
-    #                               only when documents are served from a trusted internal host
+    #                               Defaults to `true`, so internal document hosts work without
+    #                               extra configuration. Gemini cannot fetch URLs itself, so the
+    #                               connector downloads them from this service; set to `false`
+    #                               when document URLs may come from an untrusted source, to stop
+    #                               them being used to probe internal services
     # + connectionConfig - Additional HTTP connection configuration
     # + return - `()` on successful initialization; otherwise, returns an `ai:Error`
     public isolated function init(@display {label: "API Key"} string apiKey,
@@ -93,8 +88,7 @@ public isolated distinct client class ModelProvider {
             @display {label: "Service URL"} string serviceUrl = DEFAULT_GEMINI_SERVICE_URL,
             @display {label: "Maximum Tokens"} int maxTokens = DEFAULT_MAX_TOKEN_COUNT,
             @display {label: "Temperature"} decimal? temperature = (),
-            @display {label: "Thinking Budget"} int? thinkingBudget = (),
-            @display {label: "Allow Private Document Hosts"} boolean allowPrivateDocumentHosts = false,
+            @display {label: "Allow Private Document Hosts"} boolean allowPrivateDocumentHosts = true,
             @display {label: "Connection Configuration"} *ConnectionConfig connectionConfig) returns ai:Error? {
         // `ConnectionConfig` is a field-compatible subset of `http:ClientConfiguration`
         // (it omits `auth` because Gemini authenticates via the `x-goog-api-key`
@@ -108,7 +102,6 @@ public isolated distinct client class ModelProvider {
         self.modelType = modelType;
         self.temperature = temperature;
         self.maxTokens = maxTokens;
-        self.thinkingBudget = thinkingBudget;
         self.allowPrivateDocumentHosts = allowPrivateDocumentHosts;
     }
 
@@ -236,10 +229,6 @@ public isolated distinct client class ModelProvider {
         decimal? temperature = self.temperature;
         if temperature is decimal {
             generationConfig.temperature = temperature;
-        }
-        int? thinkingBudget = self.thinkingBudget;
-        if thinkingBudget is int {
-            generationConfig.thinkingConfig = {thinkingBudget};
         }
         if stop is string {
             generationConfig.stopSequences = [stop];
