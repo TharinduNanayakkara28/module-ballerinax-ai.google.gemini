@@ -80,9 +80,14 @@ public type ConnectionConfig record {|
 # Text-generation (`:generateContent`) model types for Gemini.
 # Reference: https://ai.google.dev/gemini-api/docs/models
 # NOTE: Gemini's model lineup changes frequently. Verify these IDs against the live
-# `/v1beta/models` listing for your API version; older deployments may still expose
-# the 2.x line, and newer ones may add models not listed here. Non-text models
-# (TTS/audio, image/video generation, embeddings) are intentionally excluded.
+# `/v1beta/models` listing for your API version; newer deployments may add models not
+# listed here. Non-text models (TTS/audio, image/video generation, embeddings) are
+# intentionally excluded.
+#
+# The `gemini-2.5-*` line is deliberately absent. Those models are still advertised by
+# the `/v1beta/models` listing, but a call is refused with 404 "This model ... is no
+# longer available to new users", so they cannot be reached by any key that has not
+# already used them.
 @display {label: "Gemini Model Names"}
 public enum GEMINI_MODEL_NAMES {
     # Generally available since 2026-07-21. The current flagship Flash model and the
@@ -100,14 +105,7 @@ public enum GEMINI_MODEL_NAMES {
     GEMINI_3_1_PRO_PREVIEW = "gemini-3.1-pro-preview",
     # Preview model, available since 2025-12-17. Superseded by `GEMINI_3_6_FLASH`,
     # though no shutdown date has been announced.
-    GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview",
-    # Scheduled for shutdown on 2026-10-16; migrate to `GEMINI_3_1_PRO_PREVIEW`.
-    # Note: thinking cannot be disabled on this model.
-    GEMINI_2_5_PRO = "gemini-2.5-pro",
-    # Scheduled for shutdown on 2026-10-16; migrate to `GEMINI_3_6_FLASH`.
-    GEMINI_2_5_FLASH = "gemini-2.5-flash",
-    # Scheduled for shutdown on 2026-10-16; migrate to `GEMINI_3_5_FLASH_LITE`.
-    GEMINI_2_5_FLASH_LITE = "gemini-2.5-flash-lite"
+    GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview"
 }
 
 # Embedding (`:embedContent`) model types for Gemini.

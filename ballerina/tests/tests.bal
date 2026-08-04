@@ -27,9 +27,9 @@ const PDF_URL = "http://localhost:8080/llm/assets/sample.pdf";
 const REDIRECT_IMAGE_URL = "http://localhost:8080/llm/redirect/sample.png";
 
 // The mock serves document assets from loopback, which the default (`true`) permits.
-final ModelProvider provider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL);
+final ModelProvider provider = check new (API_KEY, GEMINI_3_6_FLASH, SERVICE_URL);
 // Opted out, so the destination check itself can be exercised.
-final ModelProvider strictProvider = check new (API_KEY, GEMINI_2_5_FLASH, SERVICE_URL,
+final ModelProvider strictProvider = check new (API_KEY, GEMINI_3_6_FLASH, SERVICE_URL,
         allowPrivateDocumentHosts = false);
 final EmbeddingProvider embeddingProvider = check new (API_KEY, GEMINI_EMBEDDING_2, SERVICE_URL);
 

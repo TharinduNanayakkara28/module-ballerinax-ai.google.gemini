@@ -532,7 +532,7 @@ isolated function buildTextResponse(string text) returns json => {
         totalTokenCount: 55
     },
     responseId: "resp-abc123",
-    modelVersion: "gemini-2.5-flash-001"
+    modelVersion: "gemini-3.6-flash-07-2026"
 };
 
 isolated function buildToolCallResponse(string name, map<json> args) returns json => {
@@ -550,7 +550,7 @@ isolated function buildToolCallResponse(string name, map<json> args) returns jso
         }
     ],
     usageMetadata: {promptTokenCount: 12, candidatesTokenCount: 6, totalTokenCount: 18},
-    modelVersion: "gemini-2.5-flash"
+    modelVersion: "gemini-3.6-flash"
 };
 
 # Two tool calls in a single model turn, signed on the first part only — the shape Gemini
