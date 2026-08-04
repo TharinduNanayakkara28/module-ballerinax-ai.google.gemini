@@ -488,6 +488,136 @@ isolated function handleParseResponseError(error chatResponseError) returns erro
     return chatResponseError;
 }
 
+// ── thought signatures ──────────────────────────────────────────────────────
+
+# Markers packed onto a tool-call id, carrying what `ai:FunctionCall` cannot.
+#
+# Gemini 3 returns a `thoughtSignature` covering a model turn and rejects a later request
+# that replays that turn's calls without it. Two things therefore have to survive the round
+# trip out through `ai:ChatAssistantMessage` and back into `chat`: the signature itself,
+# and — for parallel calls, where Gemini signs only the first part of the turn — which
+# calls belong to that same turn.
+#
+# Neither fits in `ai:FunctionCall`: it is a closed record (`{name, arguments, id?}`), and
+# the agent runtime rebuilds it from persisted JSON, which would drop any extra field
+# anyway. The only value that survives both that path and `ai:Memory` is the call id, so
+# both travel appended to it and are split off before anything reaches the wire or a span.
+#
+# A connector-side cache was the alternative, and was rejected: tool-call turns are written
+# to `ai:Memory` and replayed on later runs, so a cache would lose the signature across a
+# restart, across service replicas, and whenever an identical call repeats — each of which
+# is the same 400 in a less obvious place.
+#
+# The markers cannot occur in a call id (short alphanumeric tokens) or a signature (base64).
+const THOUGHT_SIGNATURE_MARKER = "|thought-signature:";
+const BATCH_CONTINUATION_MARKER = "|thought-continuation";
+
+# A tool-call id as it travels through `ai:FunctionCall`.
+type ToolCallId record {|
+    # Gemini's own `functionCall.id`, or `()` when it sent none
+    string? id;
+    # The signature covering the model turn, present on the call that opens it
+    string? signature;
+    # Whether this call continues the parallel batch opened by an earlier call, and so
+    # belongs in the same `contents` entry rather than one of its own
+    boolean continuesBatch;
+|};
+
+# Packs what Gemini needs back onto the id handed to the caller as `ai:FunctionCall.id`.
+#
+# + id - The `functionCall.id` Gemini returned, or `()` when it returned none
+# + signature - The `thoughtSignature` on this call's part, if any
+# + continuesBatch - Whether an earlier call in the same candidate opened this turn
+# + return - The composite id, or `()` when there is nothing to carry and no id
+isolated function packToolCallId(string? id, string? signature, boolean continuesBatch) returns string? {
+    if continuesBatch {
+        return string `${id ?: ""}${BATCH_CONTINUATION_MARKER}`;
+    }
+    if signature is string && signature.length() > 0 {
+        return string `${id ?: ""}${THOUGHT_SIGNATURE_MARKER}${signature}`;
+    }
+    return id;
+}
+
+# Splits a packed id back into Gemini's own id, the turn's signature, and whether the call
+# continues a parallel batch.
+#
+# Tolerates an unmarked id — one a caller assembled by hand, or persisted before this
+# connector packed anything — by returning it unchanged as a plain call id.
+#
+# + packed - The id from an `ai:FunctionCall`
+# + return - The decomposed id
+isolated function unpackToolCallId(string? packed) returns ToolCallId {
+    if packed is () {
+        return {id: (), signature: (), continuesBatch: false};
+    }
+    // An empty left half means Gemini sent no id of its own and the id exists only to
+    // carry a marker; it must not be echoed back as `functionCall.id`.
+    int? signatureIdx = packed.indexOf(THOUGHT_SIGNATURE_MARKER);
+    if signatureIdx is int {
+        string id = packed.substring(0, signatureIdx);
+        string signature = packed.substring(signatureIdx + THOUGHT_SIGNATURE_MARKER.length());
+        return {
+            id: id.length() > 0 ? id : (),
+            signature: signature.length() > 0 ? signature : (),
+            continuesBatch: false
+        };
+    }
+    int? continuationIdx = packed.indexOf(BATCH_CONTINUATION_MARKER);
+    if continuationIdx is int {
+        string id = packed.substring(0, continuationIdx);
+        return {id: id.length() > 0 ? id : (), signature: (), continuesBatch: true};
+    }
+    return {id: packed.length() > 0 ? packed : (), signature: (), continuesBatch: false};
+}
+
+# Reports whether an assistant message is nothing but the continuation of a parallel
+# tool-call batch, and so must be folded back into the turn that opened it.
+#
+# + message - The assistant message to classify
+# + return - `true` when every tool call in it continues an earlier batch
+isolated function continuesToolCallBatch(ai:ChatAssistantMessage message) returns boolean {
+    ai:FunctionCall[]? toolCalls = message.toolCalls;
+    if toolCalls is () || toolCalls.length() == 0 {
+        return false;
+    }
+    foreach ai:FunctionCall toolCall in toolCalls {
+        if !unpackToolCallId(toolCall.id).continuesBatch {
+            return false;
+        }
+    }
+    return true;
+}
+
+# Returns the assistant message with any packed signature stripped from its tool-call ids.
+#
+# Signatures are multi-kilobyte opaque blobs; recorded verbatim they would dominate every
+# span carrying a tool call and bury the arguments that make a trace readable.
+#
+# + message - The assistant message about to be recorded
+# + return - An equivalent message carrying only Gemini's own call ids
+isolated function stripThoughtSignatures(ai:ChatAssistantMessage message) returns ai:ChatAssistantMessage {
+    ai:FunctionCall[]? toolCalls = message.toolCalls;
+    if toolCalls is () {
+        return message;
+    }
+    ai:FunctionCall[] stripped = [];
+    foreach ai:FunctionCall toolCall in toolCalls {
+        ai:FunctionCall call = {name: toolCall.name, arguments: toolCall.arguments};
+        string? id = unpackToolCallId(toolCall.id).id;
+        if id is string {
+            call.id = id;
+        }
+        stripped.push(call);
+    }
+    ai:ChatAssistantMessage result = {role: message.role, content: message.content, toolCalls: stripped};
+    string? name = message?.name;
+    if name is string {
+        result.name = name;
+    }
+    return result;
+}
+
 # Total tokens billed as output for a response.
 #
 # Gemini reports reasoning tokens in `thoughtsTokenCount`, separately from

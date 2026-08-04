@@ -211,13 +211,113 @@ function testChatToolResultWithJsonArrayStaysStructured() returns ai:Error? {
 @test:Config
 function testChatToolCallIdRoundTrips() returns ai:Error? {
     // Gemini emits an `id` on parallel function calls; it must survive into
-    // ai:FunctionCall so results can be attributed to the right call.
+    // ai:FunctionCall so results can be attributed to the right call. On Gemini 3 the id
+    // also carries the part's thought signature, so it is read back through the same
+    // unpacking the request builder uses.
     ai:ChatAssistantMessage result =
         check provider->chat([{role: ai:USER, content: "What's the weather in Colombo?"}], []);
     ai:FunctionCall[]? toolCalls = result.toolCalls;
     test:assertTrue(toolCalls is ai:FunctionCall[], "expected a tool call");
-    test:assertEquals((<ai:FunctionCall[]>toolCalls)[0].id, "call-1",
-            "the functionCall id must be carried into ai:FunctionCall");
+    ToolCallId toolCallId = unpackToolCallId((<ai:FunctionCall[]>toolCalls)[0].id);
+    test:assertEquals(toolCallId.id, "call-1", "the functionCall id must be carried into ai:FunctionCall");
+    test:assertEquals(toolCallId.signature, MOCK_THOUGHT_SIGNATURE,
+            "the part's thoughtSignature must be carried along with the id");
+}
+
+@test:Config
+function testChatToolCallThoughtSignatureSurvivesTheRoundTrip() returns ai:Error? {
+    // The regression this whole path exists for: Gemini 3 returns a thoughtSignature on
+    // the functionCall part and rejects the follow-up request if the replayed call has
+    // lost it — "Function call is missing a thought_signature in functionCall parts",
+    // 400 INVALID_ARGUMENT. ai:FunctionCall is closed and has nowhere to hold it, so it
+    // rides on the id. The mock asserts the resulting wire shape.
+    ai:ChatCompletionFunctions weatherTool = {
+        name: "getWeather",
+        description: "Get the weather for a city",
+        parameters: {"type": "object", "properties": {"city": {"type": "string"}}}
+    };
+    ai:ChatUserMessage query = {role: ai:USER, content: "Signature round-trip for Colombo"};
+    ai:ChatAssistantMessage toolCallTurn = check provider->chat([query], [weatherTool]);
+
+    ai:FunctionCall[]? toolCalls = toolCallTurn.toolCalls;
+    test:assertTrue(toolCalls is ai:FunctionCall[], "expected a tool call on the first leg");
+    ai:FunctionCall call = (<ai:FunctionCall[]>toolCalls)[0];
+
+    // Feed the assistant turn back exactly as an agent does, with the tool result
+    // correlated by the same id.
+    ai:ChatAssistantMessage result = check provider->chat([
+        query,
+        toolCallTurn,
+        {role: "function", name: call.name, content: "{\"temperature\": 20}", id: call.id}
+    ], [weatherTool]);
+    test:assertEquals(result.content, "It is 20 degrees in Colombo.");
+}
+
+@test:Config
+function testChatParallelToolCallsReassembleIntoOneTurn() returns ai:Error? {
+    // Gemini returns parallel calls as one model turn and signs only the first part — the
+    // signature covers the turn. The agent runtime replays that turn as one assistant
+    // message per call, which strands the unsigned call in a content entry of its own and
+    // draws "missing a thought_signature ... position 4". The connector must fold the
+    // continuation back into the turn it came from; the mock asserts the wire shape.
+    ai:ChatUserMessage query = {role: ai:USER, content: "Parallel tool calls for Colombo"};
+    ai:ChatAssistantMessage batch = check provider->chat([query], []);
+
+    ai:FunctionCall[]? toolCalls = batch.toolCalls;
+    test:assertTrue(toolCalls is ai:FunctionCall[], "expected the parallel tool calls");
+    ai:FunctionCall[] calls = <ai:FunctionCall[]>toolCalls;
+    test:assertEquals(calls.length(), 2, "expected both parallel calls");
+    test:assertTrue(unpackToolCallId(calls[0].id).signature is string,
+            "the first parallel call carries the turn's signature");
+    test:assertTrue(unpackToolCallId(calls[1].id).continuesBatch,
+            "an unsigned parallel call must be marked as continuing the batch");
+
+    // Replay exactly as `createFunctionCallMessages` does: one assistant message per call,
+    // each followed by its result.
+    ai:ChatAssistantMessage result = check provider->chat([
+        query,
+        {role: ai:ASSISTANT, toolCalls: [calls[0]]},
+        {role: "function", name: calls[0].name, content: "137.42", id: calls[0].id},
+        {role: ai:ASSISTANT, toolCalls: [calls[1]]},
+        {role: "function", name: calls[1].name, content: "305.5", id: calls[1].id}
+    ], []);
+    test:assertEquals(result.content, "One BAL share is 41981.81 LKR.");
+}
+
+@test:Config
+function testToolCallIdPacking() {
+    // A signature must survive being packed onto an id and split off again, whether or not
+    // Gemini supplied an id of its own.
+    ToolCallId packed = unpackToolCallId(packToolCallId("call-1", "sig-abc", false));
+    test:assertEquals(packed.id, "call-1", "an id must round-trip unchanged");
+    test:assertEquals(packed.signature, "sig-abc", "a signature must round-trip unchanged");
+    test:assertFalse(packed.continuesBatch, "a signed call opens a turn, it does not continue one");
+
+    // Gemini may return no id; the id then exists only to carry the marker and must not be
+    // echoed back as `functionCall.id`.
+    ToolCallId idless = unpackToolCallId(packToolCallId((), "sig-abc", false));
+    test:assertEquals(idless.id, (), "a signature with no id must not invent one");
+    test:assertEquals(idless.signature, "sig-abc", "the signature must survive without an id");
+
+    // A continuation carries no signature of its own — that is the whole reason it has to
+    // be folded back into the turn that does.
+    ToolCallId continuation = unpackToolCallId(packToolCallId("call-2", (), true));
+    test:assertEquals(continuation.id, "call-2", "a continuation must keep Gemini's id");
+    test:assertEquals(continuation.signature, (), "a continuation carries no signature");
+    test:assertTrue(continuation.continuesBatch, "a continuation must be recognised as one");
+
+    // History assembled by a caller by hand, or persisted before this connector packed
+    // anything, carries a bare id and must pass through untouched rather than be mangled.
+    ToolCallId bare = unpackToolCallId("call-1");
+    test:assertEquals(bare.id, "call-1", "an unmarked id must pass through unchanged");
+    test:assertEquals(bare.signature, (), "an unmarked id carries no signature");
+    test:assertFalse(bare.continuesBatch, "an unmarked id must not be taken for a continuation");
+    test:assertEquals(unpackToolCallId(()).id, (), "an absent id must stay absent");
+
+    // Signatures are base64 and may end in padding; splitting must not truncate them.
+    string padded = "CtIBAVSoXO9+/abc==";
+    test:assertEquals(unpackToolCallId(packToolCallId("call-1", padded, false)).signature, padded,
+            "a base64 signature must survive intact");
 }
 
 @test:Config

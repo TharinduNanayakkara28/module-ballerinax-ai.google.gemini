@@ -192,6 +192,12 @@ type Part record {
     FunctionCall functionCall?;
     # A tool result supplied back to the model
     FunctionResponse functionResponse?;
+    # Opaque, encrypted record of the reasoning that produced this part. Gemini 3 models
+    # return one on every `functionCall` part and reject a later request that replays the
+    # call without it ("Function call is missing a thought_signature in functionCall
+    # parts", 400 INVALID_ARGUMENT), so it must be echoed back on the part it arrived on.
+    # Attaching it to a different part — a text part, say — is itself rejected.
+    string thoughtSignature?;
 };
 
 # An ordered collection of parts attributed to a single role.
@@ -269,6 +275,8 @@ type SafetySetting record {|
     # Blocking threshold, e.g. "BLOCK_NONE"
     string threshold;
 |};
+
+# --------------------------------------
 
 # Request body for `:generateContent`.
 type GenerateContentRequest record {|
