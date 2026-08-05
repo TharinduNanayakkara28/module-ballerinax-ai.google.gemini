@@ -98,7 +98,7 @@ To avoid the download entirely, upload via the Gemini File API and pass the resu
 
 ## Model selection
 
-`GEMINI_3_6_FLASH` is the recommended default. The `GEMINI_MODEL_NAMES` enum documents the status of every supported model, including announced shutdown dates — `GEMINI_3_1_FLASH_LITE` retires on 2027-05-07. The `gemini-2.5` line is not offered: those models are closed to new API keys and a call is refused with 404.
+`GEMINI_3_6_FLASH` is the recommended default. The `GEMINI_MODEL_NAMES` enum documents the status of every supported model, including announced shutdown dates — `GEMINI_3_1_FLASH_LITE` retires on 2027-05-07 and the `gemini-2.5` line on 2026-10-16. The `gemini-2.5` models are also closed to new API keys: a key that has not used them before is refused with 404 "This model ... is no longer available to new users", so do not pick them for a new integration.
 
 For embeddings, `GEMINI_EMBEDDING_2` is the current model. `GEMINI_EMBEDDING_001` remains supported for text-only use cases.
 

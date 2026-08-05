@@ -492,11 +492,11 @@ isolated function handleParseResponseError(error chatResponseError) returns erro
 
 # Markers packed onto a tool-call id, carrying what `ai:FunctionCall` cannot.
 #
-# Gemini 3 returns a `thoughtSignature` covering a model turn and rejects a later request
-# that replays that turn's calls without it. Two things therefore have to survive the round
-# trip out through `ai:ChatAssistantMessage` and back into `chat`: the signature itself,
-# and — for parallel calls, where Gemini signs only the first part of the turn — which
-# calls belong to that same turn.
+# Gemini 3 returns a `thoughtSignature` on a `functionCall` part and rejects a later request
+# that replays that part without it. Two things therefore have to survive the round trip out
+# through `ai:ChatAssistantMessage` and back into `chat`: the signature itself, and — for
+# parallel calls, which Gemini returns as a single model turn — which calls belong to that
+# same turn. A call can need both: a signature of its own and a place in an earlier batch.
 #
 # Neither fits in `ai:FunctionCall`: it is a closed record (`{name, arguments, id?}`), and
 # the agent runtime rebuilds it from persisted JSON, which would drop any extra field
@@ -508,7 +508,9 @@ isolated function handleParseResponseError(error chatResponseError) returns erro
 # restart, across service replicas, and whenever an identical call repeats — each of which
 # is the same 400 in a less obvious place.
 #
-# The markers cannot occur in a call id (short alphanumeric tokens) or a signature (base64).
+# The markers cannot occur in a call id (short alphanumeric tokens) or a signature (base64),
+# so both can be appended to an id and split off again unambiguously. The signature marker
+# is appended last, since a signature is the only part that may itself run to the end.
 const THOUGHT_SIGNATURE_MARKER = "|thought-signature:";
 const BATCH_CONTINUATION_MARKER = "|thought-continuation";
 
@@ -516,7 +518,7 @@ const BATCH_CONTINUATION_MARKER = "|thought-continuation";
 type ToolCallId record {|
     # Gemini's own `functionCall.id`, or `()` when it sent none
     string? id;
-    # The signature covering the model turn, present on the call that opens it
+    # The `thoughtSignature` Gemini returned on this call's part, or `()` when it sent none
     string? signature;
     # Whether this call continues the parallel batch opened by an earlier call, and so
     # belongs in the same `contents` entry rather than one of its own
@@ -530,13 +532,20 @@ type ToolCallId record {|
 # + continuesBatch - Whether an earlier call in the same candidate opened this turn
 # + return - The composite id, or `()` when there is nothing to carry and no id
 isolated function packToolCallId(string? id, string? signature, boolean continuesBatch) returns string? {
+    boolean signed = signature is string && signature.length() > 0;
+    if !continuesBatch && !signed {
+        return id;
+    }
+    // Both markers can apply at once: a continuation carries its own signature whenever
+    // Gemini signed that part too, and dropping either one is a 400 on the replay.
+    string packed = id ?: "";
     if continuesBatch {
-        return string `${id ?: ""}${BATCH_CONTINUATION_MARKER}`;
+        packed += BATCH_CONTINUATION_MARKER;
     }
-    if signature is string && signature.length() > 0 {
-        return string `${id ?: ""}${THOUGHT_SIGNATURE_MARKER}${signature}`;
+    if signed {
+        packed += string `${THOUGHT_SIGNATURE_MARKER}${<string>signature}`;
     }
-    return id;
+    return packed;
 }
 
 # Splits a packed id back into Gemini's own id, the turn's signature, and whether the call
@@ -551,24 +560,24 @@ isolated function unpackToolCallId(string? packed) returns ToolCallId {
     if packed is () {
         return {id: (), signature: (), continuesBatch: false};
     }
-    // An empty left half means Gemini sent no id of its own and the id exists only to
-    // carry a marker; it must not be echoed back as `functionCall.id`.
-    int? signatureIdx = packed.indexOf(THOUGHT_SIGNATURE_MARKER);
+    // Markers are stripped from the right, so a call carrying both is decomposed in full.
+    string remainder = packed;
+    string? signature = ();
+    int? signatureIdx = remainder.indexOf(THOUGHT_SIGNATURE_MARKER);
     if signatureIdx is int {
-        string id = packed.substring(0, signatureIdx);
-        string signature = packed.substring(signatureIdx + THOUGHT_SIGNATURE_MARKER.length());
-        return {
-            id: id.length() > 0 ? id : (),
-            signature: signature.length() > 0 ? signature : (),
-            continuesBatch: false
-        };
+        string packedSignature = remainder.substring(signatureIdx + THOUGHT_SIGNATURE_MARKER.length());
+        signature = packedSignature.length() > 0 ? packedSignature : ();
+        remainder = remainder.substring(0, signatureIdx);
     }
-    int? continuationIdx = packed.indexOf(BATCH_CONTINUATION_MARKER);
+    boolean continuesBatch = false;
+    int? continuationIdx = remainder.indexOf(BATCH_CONTINUATION_MARKER);
     if continuationIdx is int {
-        string id = packed.substring(0, continuationIdx);
-        return {id: id.length() > 0 ? id : (), signature: (), continuesBatch: true};
+        continuesBatch = true;
+        remainder = remainder.substring(0, continuationIdx);
     }
-    return {id: packed.length() > 0 ? packed : (), signature: (), continuesBatch: false};
+    // An empty remainder means Gemini sent no id of its own and the id exists only to
+    // carry a marker; it must not be echoed back as `functionCall.id`.
+    return {id: remainder.length() > 0 ? remainder : (), signature, continuesBatch};
 }
 
 # Reports whether an assistant message is nothing but the continuation of a parallel

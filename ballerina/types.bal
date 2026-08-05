@@ -84,10 +84,9 @@ public type ConnectionConfig record {|
 # listed here. Non-text models (TTS/audio, image/video generation, embeddings) are
 # intentionally excluded.
 #
-# The `gemini-2.5-*` line is deliberately absent. Those models are still advertised by
-# the `/v1beta/models` listing, but a call is refused with 404 "This model ... is no
-# longer available to new users", so they cannot be reached by any key that has not
-# already used them.
+# The `gemini-2.5-*` line is retained for keys that already use it, but is closed to new
+# ones: a call from a key that has not used those models before is refused with 404 "This
+# model ... is no longer available to new users". Do not choose it for a new integration.
 @display {label: "Gemini Model Names"}
 public enum GEMINI_MODEL_NAMES {
     # Generally available since 2026-07-21. The current flagship Flash model and the
@@ -105,7 +104,16 @@ public enum GEMINI_MODEL_NAMES {
     GEMINI_3_1_PRO_PREVIEW = "gemini-3.1-pro-preview",
     # Preview model, available since 2025-12-17. Superseded by `GEMINI_3_6_FLASH`,
     # though no shutdown date has been announced.
-    GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview"
+    GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview",
+    # Closed to new API keys and scheduled for shutdown on 2026-10-16; migrate to
+    # `GEMINI_3_1_PRO_PREVIEW`. Note: thinking cannot be disabled on this model.
+    GEMINI_2_5_PRO = "gemini-2.5-pro",
+    # Closed to new API keys and scheduled for shutdown on 2026-10-16; migrate to
+    # `GEMINI_3_6_FLASH`.
+    GEMINI_2_5_FLASH = "gemini-2.5-flash",
+    # Closed to new API keys and scheduled for shutdown on 2026-10-16; migrate to
+    # `GEMINI_3_5_FLASH_LITE`.
+    GEMINI_2_5_FLASH_LITE = "gemini-2.5-flash-lite"
 }
 
 # Embedding (`:embedContent`) model types for Gemini.
@@ -177,8 +185,10 @@ type FunctionResponse record {|
     map<json> response;
 |};
 
-# A single piece of content. A part holds exactly one of the optional members;
-# the others are absent.
+# A single piece of content. A part holds exactly one of the content members below
+# (`text`, `inlineData`, `fileData`, `functionCall`, `functionResponse`); the others are
+# absent. `thoughtSignature` is per-part metadata rather than content, so it may accompany
+# whichever content member the part carries.
 type Part record {
     # Plain text content
     string text?;
@@ -191,10 +201,11 @@ type Part record {
     # A tool result supplied back to the model
     FunctionResponse functionResponse?;
     # Opaque, encrypted record of the reasoning that produced this part. Gemini 3 models
-    # return one on every `functionCall` part and reject a later request that replays the
-    # call without it ("Function call is missing a thought_signature in functionCall
-    # parts", 400 INVALID_ARGUMENT), so it must be echoed back on the part it arrived on.
-    # Attaching it to a different part — a text part, say — is itself rejected.
+    # return signatures on `functionCall` parts — in a parallel batch, on any of them — and
+    # may attach one to a `text` part as well. A request that replays a signed `functionCall`
+    # without its signature is rejected ("Function call is missing a thought_signature in
+    # functionCall parts", 400 INVALID_ARGUMENT), so each signature must be echoed back on
+    # the same part it arrived on rather than moved to another.
     string thoughtSignature?;
 };
 
