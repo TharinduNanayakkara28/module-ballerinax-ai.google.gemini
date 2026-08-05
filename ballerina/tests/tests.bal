@@ -26,11 +26,7 @@ const PDF_URL = "http://localhost:8080/llm/assets/sample.pdf";
 // 302s to IMAGE_URL, for the manual redirect loop.
 const REDIRECT_IMAGE_URL = "http://localhost:8080/llm/redirect/sample.png";
 
-// The mock serves document assets from loopback, which the default (`true`) permits.
 final ModelProvider provider = check new (API_KEY, GEMINI_3_6_FLASH, SERVICE_URL);
-// Opted out, so the destination check itself can be exercised.
-final ModelProvider strictProvider = check new (API_KEY, GEMINI_3_6_FLASH, SERVICE_URL,
-        allowPrivateDocumentHosts = false);
 final EmbeddingProvider embeddingProvider = check new (API_KEY, GEMINI_EMBEDDING_2, SERVICE_URL);
 
 // ── chat ───────────────────────────────────────────────────────────────────
@@ -555,21 +551,9 @@ function testGenerateWithImageUrl() returns ai:Error? {
 }
 
 @test:Config
-function testGenerateRejectsLoopbackDocumentUrlWhenOptedOut() {
-    // Same URL the default provider downloads happily; a provider constructed with
-    // `allowPrivateDocumentHosts = false` must refuse it, so a URL arriving from an
-    // untrusted source cannot be used to probe internal services.
-    ai:ImageDocument img = {content: IMAGE_URL};
-    string|ai:Error description = strictProvider->generate(`Describe the image at the URL. ${img}.`);
-    test:assertTrue(description is ai:Error, "a loopback document URL must be rejected when opted out");
-    test:assertTrue((<ai:Error>description).message().includes("not a public address"),
-            "expected the non-public destination error, got: " + (<ai:Error>description).message());
-}
-
-@test:Config
 function testGenerateRejectsNonHttpDocumentUrl() {
     ai:ImageDocument img = {content: "file:///etc/passwd"};
-    string|ai:Error description = strictProvider->generate(`Describe the image at the URL. ${img}.`);
+    string|ai:Error description = provider->generate(`Describe the image at the URL. ${img}.`);
     test:assertTrue(description is ai:Error, "a non-HTTP document URL must be rejected");
     test:assertTrue((<ai:Error>description).message().includes("Only 'http' and 'https'"),
             "expected the scheme error, got: " + (<ai:Error>description).message());
@@ -579,33 +563,9 @@ function testGenerateRejectsNonHttpDocumentUrl() {
 function testGenerateFollowsDocumentRedirect() returns ai:Error? {
     // Redirects are now followed by hand rather than by the HTTP client, so that each hop
     // can be revalidated. This covers that loop still resolving a 302 to the real asset.
-    // The per-hop *rejection* can only be unit-tested (see testNonPublicHostDetection):
-    // the mock is itself on loopback, so an end-to-end redirect into a private address
-    // would be blocked on the first hop and prove nothing about the second.
     ai:ImageDocument img = {content: REDIRECT_IMAGE_URL};
     string description = check provider->generate(`Describe the image at the URL. ${img}.`);
     test:assertEquals(description, "This is a sample image description.");
-}
-
-@test:Config
-function testNonPublicHostDetection() {
-    // Table-check the address classifier directly; the ranges are easy to get subtly wrong.
-    string[] blocked = [
-        "localhost", "app.localhost", "127.0.0.1", "127.1.2.3", "10.0.0.5", "172.16.0.1",
-        "172.31.255.254", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
-        "192.0.0.1", "::1", "::", "fc00::1", "fd12:3456::1", "fe80::1", "::ffff:127.0.0.1"
-    ];
-    foreach string host in blocked {
-        test:assertTrue(isNonPublicHost(host), string `'${host}' must be treated as non-public`);
-    }
-
-    string[] allowed = [
-        "example.com", "8.8.8.8", "1.1.1.1", "172.32.0.1", "172.15.0.1", "192.169.0.1",
-        "169.253.0.1", "100.128.0.1", "2606:4700::1111", "storage.googleapis.com"
-    ];
-    foreach string host in allowed {
-        test:assertFalse(isNonPublicHost(host), string `'${host}' must be treated as public`);
-    }
 }
 
 @test:Config
