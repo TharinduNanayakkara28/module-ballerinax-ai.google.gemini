@@ -255,11 +255,11 @@ function testChatToolCallThoughtSignatureSurvivesTheRoundTrip() returns ai:Error
 
 @test:Config
 function testChatParallelToolCallsReassembleIntoOneTurn() returns ai:Error? {
-    // Gemini returns parallel calls as one model turn; here only the first part is signed.
-    // The agent runtime replays that turn as one assistant message per call, which strands
-    // the unsigned call in a content entry of its own and draws "missing a thought_signature
-    // ... position 4". The connector must fold the continuation back into the turn it came
-    // from; the mock asserts the wire shape.
+    // Gemini returns parallel calls as one model turn and signs only the first part — the
+    // signature covers the turn. The agent runtime replays that turn as one assistant
+    // message per call, which strands the unsigned call in a content entry of its own and
+    // draws "missing a thought_signature ... position 4". The connector must fold the
+    // continuation back into the turn it came from; the mock asserts the wire shape.
     ai:ChatUserMessage query = {role: ai:USER, content: "Parallel tool calls for Colombo"};
     ai:ChatAssistantMessage batch = check provider->chat([query], []);
 
@@ -299,16 +299,16 @@ function testToolCallIdPacking() {
     test:assertEquals(idless.id, (), "a signature with no id must not invent one");
     test:assertEquals(idless.signature, "sig-abc", "the signature must survive without an id");
 
-    // A continuation may carry no signature of its own — that is the case that has to be
-    // folded back into the turn that does.
+    // A continuation normally carries no signature of its own — that is the whole reason it
+    // has to be folded back into the turn that does.
     ToolCallId continuation = unpackToolCallId(packToolCallId("call-2", (), true));
     test:assertEquals(continuation.id, "call-2", "a continuation must keep Gemini's id");
     test:assertEquals(continuation.signature, (), "a continuation carries no signature");
     test:assertTrue(continuation.continuesBatch, "a continuation must be recognised as one");
 
-    // Gemini may sign any part of a parallel batch, so the two markers are not exclusive:
-    // a signed continuation must keep both, or the replay draws the same 400 as an
-    // unsigned first call.
+    // The two markers are independent, not exclusive. Gemini signs the first call of a
+    // batch, so a signed continuation is not the shape it normally sends — but a signature
+    // that does arrive on a later part must not be dropped in favour of the marker.
     ToolCallId signedContinuation = unpackToolCallId(packToolCallId("call-2", "sig-abc", true));
     test:assertEquals(signedContinuation.id, "call-2", "a signed continuation must keep Gemini's id");
     test:assertEquals(signedContinuation.signature, "sig-abc",

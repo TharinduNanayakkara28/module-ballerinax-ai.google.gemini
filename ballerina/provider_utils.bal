@@ -492,11 +492,12 @@ isolated function handleParseResponseError(error chatResponseError) returns erro
 
 # Markers packed onto a tool-call id, carrying what `ai:FunctionCall` cannot.
 #
-# Gemini 3 returns a `thoughtSignature` on a `functionCall` part and rejects a later request
-# that replays that part without it. Two things therefore have to survive the round trip out
-# through `ai:ChatAssistantMessage` and back into `chat`: the signature itself, and — for
-# parallel calls, which Gemini returns as a single model turn — which calls belong to that
-# same turn. A call can need both: a signature of its own and a place in an earlier batch.
+# Gemini 3 returns a `thoughtSignature` covering a model turn and rejects a later request
+# that replays that turn's calls without it. Two things therefore have to survive the round
+# trip out through `ai:ChatAssistantMessage` and back into `chat`: the signature itself,
+# and — for parallel calls, where Gemini signs the first part of the turn — which calls
+# belong to that same turn. The two markers are kept independent rather than exclusive: a
+# signature that does arrive on a later part of a batch is carried rather than dropped.
 #
 # Neither fits in `ai:FunctionCall`: it is a closed record (`{name, arguments, id?}`), and
 # the agent runtime rebuilds it from persisted JSON, which would drop any extra field
@@ -536,8 +537,8 @@ isolated function packToolCallId(string? id, string? signature, boolean continue
     if !continuesBatch && !signed {
         return id;
     }
-    // Both markers can apply at once: a continuation carries its own signature whenever
-    // Gemini signed that part too, and dropping either one is a 400 on the replay.
+    // Gemini signs the first call of a batch, so a signed continuation is not the shape it
+    // normally sends — but if one arrives, packing must not be what loses the signature.
     string packed = id ?: "";
     if continuesBatch {
         packed += BATCH_CONTINUATION_MARKER;

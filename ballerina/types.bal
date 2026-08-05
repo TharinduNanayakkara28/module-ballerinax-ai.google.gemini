@@ -201,11 +201,11 @@ type Part record {
     # A tool result supplied back to the model
     FunctionResponse functionResponse?;
     # Opaque, encrypted record of the reasoning that produced this part. Gemini 3 models
-    # return signatures on `functionCall` parts — in a parallel batch, on any of them — and
-    # may attach one to a `text` part as well. A request that replays a signed `functionCall`
-    # without its signature is rejected ("Function call is missing a thought_signature in
-    # functionCall parts", 400 INVALID_ARGUMENT), so each signature must be echoed back on
-    # the same part it arrived on rather than moved to another.
+    # return one on the `functionCall` part that opens a model turn; in a parallel batch that
+    # is the first call, and the signature covers the turn as a whole rather than the one
+    # call. A request replaying a signed call without it is rejected ("Function call is
+    # missing a thought_signature in functionCall parts", 400 INVALID_ARGUMENT), so a
+    # signature must be echoed back on the part it arrived on rather than moved to another.
     string thoughtSignature?;
 };
 

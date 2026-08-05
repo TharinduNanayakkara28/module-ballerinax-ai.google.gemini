@@ -274,8 +274,9 @@ isolated function convertCandidateToAssistantMessage(Candidate candidate) return
             ai:FunctionCall call = {name: functionCall.name, arguments: functionCall.args ?: {}};
             // Gemini 3 rejects a replay of this call that has lost the signature it arrived
             // with, and `ai:FunctionCall` has no field to hold one, so it rides on the id.
-            // Parallel calls arrive as one model turn, so every call after the first is also
-            // marked as a continuation of it — independently of whether that part was signed.
+            // On parallel calls Gemini signs the first part — the signature covers the whole
+            // turn — so the rest are marked as continuations of it, and a signature on one of
+            // them is carried too rather than discarded by the marking.
             string? id = packToolCallId(functionCall.id, part.thoughtSignature, toolCalls.length() > 0);
             if id is string {
                 call.id = id;
