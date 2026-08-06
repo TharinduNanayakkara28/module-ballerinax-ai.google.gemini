@@ -29,7 +29,6 @@ const DEFAULT_GEMINI_SERVICE_URL = "https://generativelanguage.googleapis.com/v1
 # with `finishReason` "MAX_TOKENS" and no text part. This is a ceiling, not a target —
 # billing follows the tokens actually produced.
 const DEFAULT_MAX_TOKEN_COUNT = 65536;
-// const DEFAULT_TEMPERATURE = 0.7d;
 
 # Header used to authenticate Gemini API requests with an API key.
 const API_KEY_HEADER = "x-goog-api-key";

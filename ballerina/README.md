@@ -18,7 +18,7 @@ The `ai.google.gemini` connector plugs Gemini into the Ballerina [`ai`](https://
 - **`chat` accepts text only.** Images, PDFs, and other documents are supported through `generate` (see [Multimodal input](#multimodal-input)); passing a non-text `ai:Document` to `chat` returns an error.
 - **Streaming is not available.** The `ai:ModelProvider` interface defines only `chat` and `generate`, so there is no streaming API to implement.
 - **Gemini Developer API only.** Vertex AI endpoints (`{location}-aiplatform.googleapis.com`, OAuth bearer credentials, `publishers/google/models/...` paths) are not supported.
-- **Document URLs are fetched by the connector.** Gemini cannot fetch arbitrary web URLs, so an `ai:Url` in a prompt is downloaded locally and sent inline. Only `http` and `https` are accepted, including on every redirect hop.
+- **Document URLs are fetched by the connector.** Gemini cannot fetch arbitrary web URLs, so an `ai:Url` in a prompt is downloaded locally and sent inline. Only `http` and `https` are accepted, including on every redirect hop. No restriction is placed on the destination host: a URL that resolves to a loopback, private, link-local, or other internal address (including cloud metadata endpoints) is fetched the same as any public one. Applications that accept document URLs from untrusted end users are responsible for validating or restricting those URLs before passing them to this connector, or for enforcing an egress policy at the network layer.
 
 ## Prerequisites
 
