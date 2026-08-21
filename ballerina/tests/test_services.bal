@@ -43,6 +43,11 @@ service /llm on new http:Listener(8080) {
         if operation.endsWith(":batchEmbedContents") {
             return {embeddings: [{values: [0.1, 0.2]}, {values: [0.3, 0.4]}]};
         }
+        // :streamGenerateContent — replies in Gemini's SSE framing. Handled before the
+        // `:generateContent` branch below, which would otherwise claim it by fall-through.
+        if operation.endsWith(":streamGenerateContent") {
+            return buildStreamResponse(extractFirstText(payload));
+        }
         // :generateContent — assert the request shape, then pick a response based
         // on the first text part.
         string promptText = extractFirstText(payload);
@@ -136,6 +141,123 @@ service /llm on new http:Listener(8080) {
         response.setHeader("Location", string `/llm/assets/${name}`);
         return response;
     }
+}
+
+// Picks the streamed reply for a `:streamGenerateContent` request, keyed on the prompt.
+function buildStreamResponse(string promptText) returns http:Response {
+    if promptText.startsWith("Stream auth error") {
+        http:Response unauthorized = new;
+        unauthorized.statusCode = 401;
+        unauthorized.setJsonPayload({
+            'error: {code: 401, message: "API key not valid.", status: "UNAUTHENTICATED"}
+        });
+        return unauthorized;
+    }
+    // A turn ending in a function call. Gemini reports "STOP" rather than a tool-specific
+    // finish reason, and signs the part — both of which the mapping has to cope with.
+    if promptText.startsWith("Stream tool call") {
+        return buildSseResponse([
+            streamChunk([{text: "Looking that up. "}], ()),
+            {
+                responseId: STREAM_RESPONSE_ID,
+                modelVersion: STREAM_MODEL_VERSION,
+                candidates: [
+                    {
+                        content: {
+                            role: "model",
+                            parts: [
+                                {
+                                    functionCall: {id: "call-1", name: "getWeather", args: {city: "Colombo"}},
+                                    thoughtSignature: MOCK_THOUGHT_SIGNATURE
+                                }
+                            ]
+                        },
+                        finishReason: "STOP",
+                        index: 0
+                    }
+                ],
+                usageMetadata: STREAM_USAGE
+            }
+        ]);
+    }
+    // Two calls in one streamed turn, signed once on the first — the parallel-batch shape.
+    if promptText.startsWith("Stream parallel tools") {
+        return buildSseResponse([
+            {
+                responseId: STREAM_RESPONSE_ID,
+                modelVersion: STREAM_MODEL_VERSION,
+                candidates: [
+                    {
+                        content: {
+                            role: "model",
+                            parts: [
+                                {
+                                    functionCall: {id: "call-1", name: "getWeather", args: {city: "Colombo"}},
+                                    thoughtSignature: MOCK_THOUGHT_SIGNATURE
+                                },
+                                {functionCall: {id: "call-2", name: "getStockPrice", args: {symbol: "BAL"}}}
+                            ]
+                        },
+                        finishReason: "STOP",
+                        index: 0
+                    }
+                ]
+            }
+        ]);
+    }
+    // Chain-of-thought parts, which must not be folded into the answer text.
+    if promptText.startsWith("Stream thoughts") {
+        return buildSseResponse([
+            streamChunk([{text: "weighing options", thought: true}], ()),
+            streamChunk([{text: "The answer is 42."}], "STOP")
+        ]);
+    }
+    if promptText.startsWith("Stream truncated") {
+        return buildSseResponse([streamChunk([{text: "Half a sen"}], "MAX_TOKENS")]);
+    }
+    if promptText.startsWith("Stream filtered") {
+        return buildSseResponse([streamChunk([], "SAFETY")]);
+    }
+    // Default: plain text delivered in fragments, usage only on the closing chunk.
+    return buildSseResponse([
+        streamChunk([{text: "Hello"}], ()),
+        streamChunk([{text: ", world"}], ()),
+        streamChunk([{text: "!"}], "STOP")
+    ]);
+}
+
+const STREAM_RESPONSE_ID = "resp-stream-1";
+const STREAM_MODEL_VERSION = "gemini-3.6-flash-001";
+final readonly & json STREAM_USAGE = {
+    promptTokenCount: 11,
+    candidatesTokenCount: 5,
+    thoughtsTokenCount: 3,
+    totalTokenCount: 19
+};
+
+// Builds one streamed chunk carrying the given parts, attaching usage alongside the
+// finish reason so the mock mirrors Gemini's own final-chunk accounting.
+function streamChunk(json[] parts, string? finishReason) returns json {
+    map<json> candidate = {content: {role: "model", parts}, index: 0};
+    map<json> chunk = {responseId: STREAM_RESPONSE_ID, modelVersion: STREAM_MODEL_VERSION};
+    if finishReason is string {
+        candidate["finishReason"] = finishReason;
+        chunk["usageMetadata"] = STREAM_USAGE;
+    }
+    chunk["candidates"] = [candidate];
+    return chunk;
+}
+
+// Frames chunks the way `:streamGenerateContent?alt=sse` does: one `data:` event each,
+// and no terminating sentinel — the stream simply ends.
+function buildSseResponse(json[] chunks) returns http:Response {
+    string body = "";
+    foreach json chunk in chunks {
+        body += string `data: ${chunk.toJsonString()}${"\n\n"}`;
+    }
+    http:Response response = new;
+    response.setTextPayload(body, "text/event-stream");
+    return response;
 }
 
 // Asserts the shape of a `:generateContent` request for the scenarios that

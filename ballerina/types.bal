@@ -14,6 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import ballerina/ai;
 import ballerina/http;
 
 # Configurations for controlling the behaviours when communicating with a remote HTTP endpoint.
@@ -200,6 +201,11 @@ type Part record {
     FunctionCall functionCall?;
     # A tool result supplied back to the model
     FunctionResponse functionResponse?;
+    # Marks this part as the model's chain-of-thought rather than its answer. Gemini sets
+    # it only when `generationConfig.thinkingConfig.includeThoughts` is requested, which
+    # this connector does not currently do — but a thought part must never be folded into
+    # answer text, so it is modelled and routed to `delta.reasoning` when streaming.
+    boolean thought?;
     # Opaque, encrypted record of the reasoning that produced this part. Gemini 3 models
     # return one on the `functionCall` part that opens a model turn; in a parallel batch that
     # is the first call, and the signature covers the turn as a whole rather than the one
@@ -401,3 +407,178 @@ type BatchEmbedContentsResponse record {
     # The generated embeddings, in request order
     ContentEmbedding[] embeddings;
 };
+
+// ── Streaming: wire → normalized mapping ───────────────────────────────────
+// `:streamGenerateContent?alt=sse` emits one SSE `data:` event per chunk, each carrying a
+// `GenerateContentResponse` of the same shape as a non-streaming response — so the wire
+// types above are reused rather than duplicated. These functions project that onto the
+// provider-agnostic `ai:ChatCompletionChunk` that `chatStream` must return.
+// Reference: https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent
+
+# Maps one streamed Gemini chunk onto the normalized `ai:ChatCompletionChunk`.
+#
+# Unlike OpenAI-compatible APIs, Gemini does not fragment function-call arguments across
+# chunks: a `functionCall` part arrives with its `args` object already complete. Each such
+# part therefore becomes a single self-contained `ai:ToolCallChunk` — a one-fragment
+# accumulation, which the `index`-keyed contract still accommodates. Gemini gives these
+# calls no index of its own, so one is assigned from a counter running across the whole
+# stream, threaded in and out through `toolCallIndexStart`.
+#
+# + w - The parsed chunk
+# + toolCallIndexStart - The next unused tool-call index at the start of this chunk
+# + return - The normalized chunk, and the next unused tool-call index after it
+isolated function toAiChunk(GenerateContentResponse w, int toolCallIndexStart)
+        returns [ai:ChatCompletionChunk, int] {
+    int toolCallIndex = toolCallIndexStart;
+    ai:ChatCompletionChunkChoice[] choices = [];
+    boolean terminal = false;
+
+    foreach Candidate candidate in w.candidates ?: [] {
+        ai:ChatCompletionChunkDelta delta = {};
+        string text = "";
+        string reasoning = "";
+        ai:ToolCallChunk[] toolCalls = [];
+
+        Content? content = candidate.content;
+        if content is Content {
+            ai:ROLE? role = mapRole(content.role);
+            if role is ai:ROLE {
+                delta.role = role;
+            }
+            foreach Part part in content.parts {
+                string? partText = part.text;
+                if partText is string {
+                    // A thought part is chain-of-thought, not answer text; folding it into
+                    // `content` would leak the model's reasoning into the reply.
+                    if part.thought == true {
+                        reasoning += partText;
+                    } else {
+                        text += partText;
+                    }
+                }
+                FunctionCall? functionCall = part.functionCall;
+                if functionCall is FunctionCall {
+                    ai:ToolCallChunk toolCall = {
+                        index: toolCallIndex,
+                        'function: {
+                            name: functionCall.name,
+                            arguments: (functionCall.args ?: {}).toJsonString()
+                        }
+                    };
+                    // Gemini 3 rejects a replay of this call that has lost the signature it
+                    // arrived with, and `ai:ToolCallChunk` has no field to hold one, so it
+                    // rides on the id exactly as it does on the non-streaming path. The whole
+                    // stream is a single model turn, so every call after the first is marked
+                    // a continuation of the turn the first one opened.
+                    string? id = packToolCallId(functionCall.id, part.thoughtSignature, toolCallIndex > 0);
+                    if id is string {
+                        toolCall.id = id;
+                    }
+                    toolCalls.push(toolCall);
+                    toolCallIndex += 1;
+                }
+            }
+        }
+
+        if text.length() > 0 {
+            delta.content = text;
+        }
+        if reasoning.length() > 0 {
+            delta.reasoning = reasoning;
+        }
+        if toolCalls.length() > 0 {
+            delta.toolCalls = toolCalls;
+        }
+
+        // `toolCallIndex` counts every call seen so far in the stream, this chunk's included,
+        // so a turn whose function call and terminal "STOP" arrive together still reports
+        // `tool_calls` rather than `stop`.
+        ai:FinishReason? finishReason = mapFinishReason(candidate.finishReason, toolCallIndex > 0);
+        if finishReason is ai:FinishReason {
+            terminal = true;
+        }
+        choices.push({index: candidate.index ?: 0, delta, finishReason});
+    }
+
+    ai:ChatCompletionChunk chunk = {choices};
+    string? responseId = w.responseId;
+    if responseId is string {
+        chunk.id = responseId;
+    }
+    // The concrete version behind a floating alias such as "gemini-3.6-flash".
+    string? modelVersion = w.modelVersion;
+    if modelVersion is string {
+        chunk.model = modelVersion;
+    }
+    // Gemini repeats a cumulative `usageMetadata` on every chunk, whereas the normalized
+    // type documents usage as final-chunk-only. Carrying it on every chunk would let a
+    // consumer that sums chunk usage over-count many times over, so it is attached only to
+    // the chunk reporting a finish reason — where Gemini's figures are complete.
+    if terminal {
+        UsageMetadata? usage = w.usageMetadata;
+        if usage is UsageMetadata {
+            ai:CompletionTokenUsage tokenUsage = {};
+            int? promptTokens = usage.promptTokenCount;
+            if promptTokens is int {
+                tokenUsage.promptTokens = promptTokens;
+            }
+            // Candidate plus reasoning tokens: Gemini reports thinking separately even
+            // though it is billed as output. See `totalOutputTokenCount`.
+            int? completionTokens = totalOutputTokenCount(usage);
+            if completionTokens is int {
+                tokenUsage.completionTokens = completionTokens;
+            }
+            int? totalTokens = usage.totalTokenCount;
+            if totalTokens is int {
+                tokenUsage.totalTokens = totalTokens;
+            }
+            chunk.usage = tokenUsage;
+        }
+    }
+    return [chunk, toolCallIndex];
+}
+
+# Safely maps a Gemini content role onto the `ai:ROLE` enum. Gemini attributes model output
+# to the "model" role, which normalizes to `ai:ASSISTANT`. Returns `()` for absent or
+# unrecognized values rather than panicking on a cast.
+#
+# + role - The role string from the streamed content
+# + return - The mapped `ai:ROLE`, or `()` when absent/unrecognized
+isolated function mapRole(string? role) returns ai:ROLE? {
+    if role == GEMINI_ROLE_MODEL {
+        return ai:ASSISTANT;
+    }
+    if role == GEMINI_ROLE_USER {
+        return ai:USER;
+    }
+    return ();
+}
+
+# Safely maps a Gemini finish reason onto the `ai:FinishReason` enum, returning `()` while
+# the stream is still running (no reason reported yet).
+#
+# + finishReason - The finish reason from the streamed candidate
+# + sawToolCall - Whether the stream has produced a function call up to and including this
+#                 chunk
+# + return - The mapped `ai:FinishReason`, or `()` when absent
+isolated function mapFinishReason(string? finishReason, boolean sawToolCall) returns ai:FinishReason? {
+    if finishReason is () || finishReason.length() == 0 {
+        return ();
+    }
+    if finishReason == "STOP" {
+        // Gemini has no dedicated tool-call finish reason — a turn ending in a function call
+        // still reports "STOP". Passing plain `stop` through would tell an agent loop the
+        // turn was a final answer and strand the pending call unexecuted.
+        return sawToolCall ? ai:TOOL_CALLS : ai:STOP;
+    }
+    if finishReason == "MAX_TOKENS" {
+        return ai:LENGTH;
+    }
+    // Everything else — the safety/policy family ("SAFETY", "RECITATION", "BLOCKLIST",
+    // "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY") and operational reasons such as "OTHER",
+    // "LANGUAGE" and "MALFORMED_FUNCTION_CALL" — means content was withheld or cut short.
+    // `ai:FinishReason` carries only the four OpenAI values, so all of them collapse onto
+    // `content_filter`, the sole member denoting an abnormal stop. The mapping is lossy;
+    // the specific reason is not recoverable from the normalized chunk.
+    return ai:CONTENT_FILTER;
+}

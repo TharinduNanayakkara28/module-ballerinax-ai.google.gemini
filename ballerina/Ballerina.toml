@@ -9,6 +9,17 @@ org = "ballerinax"
 repository = "https://github.com/ballerina-platform/module-ballerinax-ai.google.gemini"
 version = "1.0.2"
 
+# TODO: drop this block and let `ballerina/ai` resolve from Ballerina Central once a release
+# carrying the streaming contract (`chatStream`/`generateStream`) is published. No published
+# version has it yet — 1.13.0 and 1.14.0 on Central both predate it — so it is pinned to the
+# local repository, populated with `bal pack && bal push --repository=local` from
+# module-ballerina-ai on branch `feat/add-chat-stream-support`.
+[[dependency]]
+org = "ballerina"
+name = "ai"
+version = "1.13.0"
+repository = "local"
+
 [platform.java21]
 graalvmCompatible = true
 

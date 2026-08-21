@@ -164,6 +164,45 @@ public isolated distinct client class ModelProvider {
         return message;
     }
 
+    # Sends a streaming chat request to the Gemini model with the given messages and tools.
+    #
+    # The request body is identical to the non-streaming one; only the method and the
+    # `alt=sse` transport differ, so `buildGenerateContentRequest` is shared with `chat`.
+    #
+    # + messages - List of chat messages or a single user message
+    # + tools - Tool definitions to be used for the tool call
+    # + stop - Stop sequence to stop the completion
+    # + return - A stream of chat completion chunks, or an error in-case of failures
+    remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools = [], string? stop = ())
+            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        GenerateContentRequest request = check self.buildGenerateContentRequest(messages, tools, stop);
+
+        map<string|string[]> headers = {[API_KEY_HEADER]: self.apiKey};
+        // `alt=sse` is required. Without it `:streamGenerateContent` returns the chunks as a
+        // single incrementally-written JSON array rather than as Server-Sent Events, and
+        // `getSseEventStream` would have nothing to parse.
+        string path = string `/models/${self.modelType}:streamGenerateContent?alt=sse`;
+        http:Response|error response = self.httpClient->post(path, request, headers);
+        if response is error {
+            return mapHttpError(response);
+        }
+        // With `http:Response` as the target type the client surfaces 4xx/5xx as an ordinary
+        // response instead of an error, so the status has to be checked here; otherwise a
+        // rejected key or bad request would only surface downstream as an empty SSE stream.
+        if response.statusCode < 200 || response.statusCode >= 300 {
+            return mapStreamErrorResponse(response);
+        }
+        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
+        if sseStream is error {
+            return error ai:Error("Failed to open the SSE stream from the model", sseStream);
+        }
+        // Bound to an explicitly typed local before returning: `new (...)` cannot infer the
+        // stream's type parameters when the enclosing function returns a union.
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new GeminiChunkIterator(sseStream));
+        return chunkStream;
+    }
+
     # Sends a chat request to the model and generates a value that belongs to the type
     # corresponding to the type descriptor argument.
     #
@@ -172,6 +211,17 @@ public isolated distinct client class ModelProvider {
     # + return - Generates a value that belongs to the type, or an error if generation fails
     isolated remote function generate(ai:Prompt prompt, @display {label: "Expected type"} typedesc<anydata> td = <>) returns td|ai:Error = @java:Method {
         'class: "io.ballerina.lib.ai.google.gemini.Generator"
+    } external;
+
+    # Sends a streaming chat request to the model using the given prompt and streams back
+    # the generated answer. Only `string` is supported as the expected type.
+    #
+    # + prompt - The prompt to use in the chat request
+    # + td - The expected type of the streamed value; must be `string`
+    # + return - A stream of the generated value, or an error if the type is unsupported
+    remote function generateStream(ai:Prompt prompt, @display {label: "Expected type"} typedesc<anydata> td = <>)
+            returns stream<td, ai:Error?>|ai:Error = @java:Method {
+        'class: "io.ballerina.lib.ai.google.gemini.StreamGenerator"
     } external;
 
     # Builds a Gemini `generateContent` request from the normalized `ai` chat messages.
@@ -512,4 +562,134 @@ isolated function convertMessageToJson(ai:ChatMessage[]|ai:ChatMessage messages)
     }
     return messages !is ai:ChatUserMessage|ai:ChatSystemMessage ? messages :
         {role: messages.role, content: check getChatMessageStringContent(messages.content), name: messages.name};
+}
+
+# Iterator that converts Gemini's Server-Sent Event stream into a stream of normalized
+# `ai:ChatCompletionChunk` values. Each `data:` payload is parsed as a
+# `GenerateContentResponse` — streamed chunks share the non-streaming response shape — and
+# mapped via `toAiChunk`. Blank lines and keep-alive comments are skipped.
+#
+# Gemini sends no end-of-stream sentinel (there is no OpenAI-style `[DONE]`); the stream
+# simply ends, so exhaustion of the underlying SSE stream is the only termination signal.
+class GeminiChunkIterator {
+    private stream<http:SseEvent, error?> sseStream;
+    // Tool calls are numbered across the whole stream: Gemini assigns them no index of its
+    // own, while the normalized contract keys tool-call accumulation by one. See `toAiChunk`.
+    private int toolCallIndex = 0;
+
+    isolated function init(stream<http:SseEvent, error?> sseStream) {
+        self.sseStream = sseStream;
+    }
+
+    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        while true {
+            record {|http:SseEvent value;|}|error? event = self.sseStream.next();
+            if event is () {
+                return ();
+            }
+            if event is error {
+                return error ai:Error("Error while reading the model stream", event);
+            }
+            string? data = event.value.data;
+            if data is () {
+                continue;
+            }
+            string trimmedData = data.trim();
+            if trimmedData == "" {
+                continue;
+            }
+            json|error payload = trimmedData.fromJsonString();
+            if payload is error {
+                continue;
+            }
+            GenerateContentResponse|error wireChunk = payload.cloneWithType();
+            if wireChunk is error {
+                continue;
+            }
+            [ai:ChatCompletionChunk, int] [chunk, nextToolCallIndex] =
+                toAiChunk(wireChunk, self.toolCallBase());
+            self.advanceToolCallIndex(nextToolCallIndex);
+            return {value: chunk};
+        }
+    }
+
+    public isolated function close() returns ai:Error? {
+        error? result = self.sseStream.close();
+        if result is error {
+            return error ai:Error("Error while closing the model stream", result);
+        }
+        return ();
+    }
+
+    // The running tool-call index is read and advanced through these two accessors so the
+    // mutation stays lock-guarded, as an isolated method requires.
+    private isolated function toolCallBase() returns int {
+        lock {
+            return self.toolCallIndex;
+        }
+    }
+
+    private isolated function advanceToolCallIndex(int next) {
+        lock {
+            self.toolCallIndex = next;
+        }
+    }
+}
+
+# Builds the string stream behind the dependently-typed `generateStream`. The native
+# `StreamGenerator` shim trampolines here so the type gating stays in Ballerina. Only
+# `string` is supported; other types yield an error, because a partial generation is a
+# valid value only for `string`. When valid, the underlying `chatStream` chunks are
+# projected onto their text fragments.
+#
+# Not `isolated`: it calls the non-isolated `chatStream`.
+#
+# + llmModel - The model provider whose `chatStream` supplies the chunks
+# + prompt - The prompt to send to the model
+# + td - The caller's expected type; must be `string`
+# + return - A stream of text fragments, or an error if the type is unsupported
+function generateLlmResponseStream(ModelProvider llmModel, ai:Prompt prompt, typedesc<anydata> td)
+        returns stream<string, ai:Error?>|ai:Error {
+    if td !is typedesc<string> {
+        return error ai:Error("This data type is not supported for streaming. " +
+                "'generateStream' supports only 'string'; use 'generate' for structured types.");
+    }
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check llmModel->chatStream({role: ai:USER, content: prompt});
+    stream<string, ai:Error?> textStream = new (new ChunkTextIterator(chunks));
+    return textStream;
+}
+
+# Projects a normalized `ai:ChatCompletionChunk` stream onto its text content, yielding
+# each non-empty `delta.content` fragment and skipping tool-call, reasoning and usage-only
+# chunks. Backs `generateLlmResponseStream`.
+class ChunkTextIterator {
+    private stream<ai:ChatCompletionChunk, ai:Error?> chunks;
+
+    isolated function init(stream<ai:ChatCompletionChunk, ai:Error?> chunks) {
+        self.chunks = chunks;
+    }
+
+    public isolated function next() returns record {|string value;|}|ai:Error? {
+        while true {
+            record {|ai:ChatCompletionChunk value;|}|ai:Error? next = self.chunks.next();
+            if next is () {
+                return ();
+            }
+            if next is ai:Error {
+                return next;
+            }
+            ai:ChatCompletionChunkChoice[] choices = next.value.choices;
+            if choices.length() == 0 {
+                continue;
+            }
+            string? content = choices[0].delta.content;
+            if content is string && content.length() > 0 {
+                return {value: content};
+            }
+        }
+    }
+
+    public isolated function close() returns ai:Error? {
+        return self.chunks.close();
+    }
 }
