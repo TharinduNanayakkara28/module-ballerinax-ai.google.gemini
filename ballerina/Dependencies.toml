@@ -403,7 +403,7 @@ dependencies = [
 ]
 
 [[package]]
-org = "ballerinax"
+org = "tharindunanayakkaraintern"
 name = "ai.google.gemini"
 version = "1.0.2"
 dependencies = [
@@ -414,6 +414,6 @@ dependencies = [
 	{org = "ballerina", name = "test"}
 ]
 modules = [
-	{org = "ballerinax", packageName = "ai.google.gemini", moduleName = "ai.google.gemini"}
+	{org = "tharindunanayakkaraintern", packageName = "ai.google.gemini", moduleName = "ai.google.gemini"}
 ]
 
