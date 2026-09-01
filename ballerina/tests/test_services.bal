@@ -27,7 +27,8 @@ const MOCK_THOUGHT_SIGNATURE = "CtIBAVSoXO9sig1234567890abcdefGHIJKLMNOP+/=";
 // layer unique to Gemini is covered.
 service /llm on new http:Listener(8080) {
     resource function post models/[string operation](@http:Payload json payload,
-            @http:Header {name: "x-goog-api-key"} string? apiKeyHeader = ())
+            @http:Header {name: "x-goog-api-key"} string? apiKeyHeader = (),
+            string? alt = ())
             returns json|http:Response|error {
         // Authentication must not silently break: every request, on every endpoint,
         // has to carry the API key in the documented header.
@@ -46,7 +47,13 @@ service /llm on new http:Listener(8080) {
         // :streamGenerateContent — replies in Gemini's SSE framing. Handled before the
         // `:generateContent` branch below, which would otherwise claim it by fall-through.
         if operation.endsWith(":streamGenerateContent") {
-            return buildStreamResponse(extractFirstText(payload));
+            // Without `alt=sse` Gemini replies with one incrementally-written JSON array
+            // instead of Server-Sent Events, and the connector's SSE parsing would have
+            // nothing to read. Nothing else in these tests would notice its loss.
+            test:assertEquals(alt, "sse", "':streamGenerateContent' must be requested with 'alt=sse'");
+            string streamPrompt = extractFirstText(payload);
+            validateStreamRequest(streamPrompt, payload);
+            return buildStreamResponse(streamPrompt);
         }
         // :generateContent — assert the request shape, then pick a response based
         // on the first text part.
@@ -143,6 +150,30 @@ service /llm on new http:Listener(8080) {
     }
 }
 
+// The streaming body is built by the same `buildGenerateContentRequest` as `chat`, so it
+// must carry the same generation config and tool declarations. Asserting it here guards
+// that sharing: a streaming path that quietly stopped sending tools, or the token ceiling,
+// would otherwise still satisfy every chunk-mapping test.
+function validateStreamRequest(string promptText, json payload) {
+    map<json> obj = payload is map<json> ? payload : {};
+
+    json generationConfig = obj["generationConfig"];
+    test:assertTrue(generationConfig is map<json>, "a streaming request must carry a generationConfig");
+    test:assertEquals((<map<json>>generationConfig)["maxOutputTokens"], DEFAULT_MAX_TOKEN_COUNT,
+            "the token ceiling must apply to streamed generations too");
+
+    json contents = obj["contents"];
+    test:assertTrue(contents is json[], "a streaming request must carry a contents array");
+
+    if promptText.startsWith("Stream tool call") || promptText.startsWith("Stream parallel tools") {
+        json tools = obj["tools"];
+        test:assertTrue(tools is json[], "tool declarations must reach the streaming endpoint");
+        map<json> toolEntry = <map<json>>(<json[]>tools)[0];
+        test:assertTrue(toolEntry.hasKey("functionDeclarations"),
+                "tools must be sent as Gemini function declarations");
+    }
+}
+
 // Picks the streamed reply for a `:streamGenerateContent` request, keyed on the prompt.
 function buildStreamResponse(string promptText) returns http:Response {
     if promptText.startsWith("Stream auth error") {
@@ -215,8 +246,39 @@ function buildStreamResponse(string promptText) returns http:Response {
     if promptText.startsWith("Stream truncated") {
         return buildSseResponse([streamChunk([{text: "Half a sen"}], "MAX_TOKENS")]);
     }
+    // A safety block: Gemini closes the turn with a candidate that has no `parts` key at
+    // all, not an empty one. The chunk still carries the finish reason and the usage, so it
+    // must survive conversion rather than being dropped as unparseable.
     if promptText.startsWith("Stream filtered") {
-        return buildSseResponse([streamChunk([], "SAFETY")]);
+        return buildSseResponse([
+            {
+                responseId: STREAM_RESPONSE_ID,
+                modelVersion: STREAM_MODEL_VERSION,
+                candidates: [{content: {role: "model"}, finishReason: "SAFETY", index: 0}],
+                usageMetadata: STREAM_USAGE
+            }
+        ]);
+    }
+    // A failure Gemini reports mid-stream, after a 2xx status line and some answer text.
+    if promptText.startsWith("Stream mid error") {
+        return buildRawSseResponse([
+            streamChunk([{text: "Half an ans"}], ()).toJsonString(),
+            "{\"error\": {\"code\": 503, \"message\": \"The model is overloaded.\", " +
+                "\"status\": \"UNAVAILABLE\"}}"
+        ]);
+    }
+    // A prompt rejected by the safety filters: no candidates at all, only the block reason.
+    if promptText.startsWith("Stream blocked prompt") {
+        return buildRawSseResponse([
+            {responseId: STREAM_RESPONSE_ID, promptFeedback: {blockReason: "SAFETY"}}.toJsonString()
+        ]);
+    }
+    // A frame that is not JSON at all — a truncated or corrupted event.
+    if promptText.startsWith("Stream malformed chunk") {
+        return buildRawSseResponse([
+            streamChunk([{text: "Half an ans"}], ()).toJsonString(),
+            "{\"candidates\": [{\"content\""
+        ]);
     }
     // Default: plain text delivered in fragments, usage only on the closing chunk.
     return buildSseResponse([
@@ -251,9 +313,19 @@ function streamChunk(json[] parts, string? finishReason) returns json {
 // Frames chunks the way `:streamGenerateContent?alt=sse` does: one `data:` event each,
 // and no terminating sentinel — the stream simply ends.
 function buildSseResponse(json[] chunks) returns http:Response {
-    string body = "";
+    string[] frames = [];
     foreach json chunk in chunks {
-        body += string `data: ${chunk.toJsonString()}${"\n\n"}`;
+        frames.push(chunk.toJsonString());
+    }
+    return buildRawSseResponse(frames);
+}
+
+// Frames already-serialized payloads, so a scenario can send a body that is deliberately
+// not valid JSON — something the `json` type cannot represent.
+function buildRawSseResponse(string[] frames) returns http:Response {
+    string body = "";
+    foreach string frame in frames {
+        body += string `data: ${frame}${"\n\n"}`;
     }
     http:Response response = new;
     response.setTextPayload(body, "text/event-stream");

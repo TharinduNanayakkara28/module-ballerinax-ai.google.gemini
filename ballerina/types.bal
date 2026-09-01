@@ -220,8 +220,13 @@ type Content record {
     # Author of the content: "user" (input) or "model" (model output). Omitted
     # for `systemInstruction`.
     string role?;
-    # The ordered parts that make up this content
-    Part[] parts;
+    # The ordered parts that make up this content.
+    #
+    # Defaulted rather than required: Gemini omits `parts` entirely on a terminal streamed
+    # chunk that carries only a finish reason (a safety block, for instance). Declaring it
+    # required makes that chunk fail conversion, which would drop the finish reason and the
+    # token usage riding on it. Requests always set it explicitly.
+    Part[] parts = [];
 };
 
 # Declares a function the model may call, described with a JSON-schema parameter object.
@@ -415,6 +420,18 @@ type BatchEmbedContentsResponse record {
 // provider-agnostic `ai:ChatCompletionChunk` that `chatStream` must return.
 // Reference: https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent
 
+# What one streamed chunk needs to know about the chunks that preceded it.
+#
+# Gemini treats every chunk as self-contained — it repeats the role on each one and numbers
+# no tool call — whereas the normalized contract describes a single message assembled across
+# chunks. This carries the little bit of cross-chunk state that gap requires.
+type StreamState record {|
+    # The next unused tool-call index
+    int toolCallIndex = 0;
+    # Whether an earlier delta has already reported the role
+    boolean roleReported = false;
+|};
+
 # Maps one streamed Gemini chunk onto the normalized `ai:ChatCompletionChunk`.
 #
 # Unlike OpenAI-compatible APIs, Gemini does not fragment function-call arguments across
@@ -422,14 +439,20 @@ type BatchEmbedContentsResponse record {
 # part therefore becomes a single self-contained `ai:ToolCallChunk` — a one-fragment
 # accumulation, which the `index`-keyed contract still accommodates. Gemini gives these
 # calls no index of its own, so one is assigned from a counter running across the whole
-# stream, threaded in and out through `toolCallIndexStart`.
+# stream, threaded in and out through `state`.
+#
+# That counter is shared across the candidates of a chunk rather than restarting per
+# candidate. This connector never sets `candidateCount`, so Gemini returns exactly one
+# candidate and the distinction cannot arise; were multiple candidates ever requested, the
+# indices would need to be tracked per candidate instead.
 #
 # + w - The parsed chunk
-# + toolCallIndexStart - The next unused tool-call index at the start of this chunk
-# + return - The normalized chunk, and the next unused tool-call index after it
-isolated function toAiChunk(GenerateContentResponse w, int toolCallIndexStart)
-        returns [ai:ChatCompletionChunk, int] {
-    int toolCallIndex = toolCallIndexStart;
+# + state - What the chunks before this one established
+# + return - The normalized chunk, and the state carried forward past it
+isolated function toAiChunk(GenerateContentResponse w, StreamState state)
+        returns [ai:ChatCompletionChunk, StreamState] {
+    int toolCallIndex = state.toolCallIndex;
+    boolean roleReported = state.roleReported;
     ai:ChatCompletionChunkChoice[] choices = [];
     boolean terminal = false;
 
@@ -441,9 +464,12 @@ isolated function toAiChunk(GenerateContentResponse w, int toolCallIndexStart)
 
         Content? content = candidate.content;
         if content is Content {
+            // Gemini stamps the role on every chunk; the normalized delta documents it as
+            // sent only on the first, so later repeats are dropped.
             ai:ROLE? role = mapRole(content.role);
-            if role is ai:ROLE {
+            if role is ai:ROLE && !roleReported {
                 delta.role = role;
+                roleReported = true;
             }
             foreach Part part in content.parts {
                 string? partText = part.text;
@@ -535,7 +561,7 @@ isolated function toAiChunk(GenerateContentResponse w, int toolCallIndexStart)
             chunk.usage = tokenUsage;
         }
     }
-    return [chunk, toolCallIndex];
+    return [chunk, {toolCallIndex, roleReported}];
 }
 
 # Safely maps a Gemini content role onto the `ai:ROLE` enum. Gemini attributes model output

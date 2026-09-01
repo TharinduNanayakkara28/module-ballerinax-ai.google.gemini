@@ -613,6 +613,16 @@ isolated function mapHttpError(error err) returns ai:Error {
 isolated function mapStreamErrorResponse(http:Response response) returns ai:Error {
     json|error payload = response.getJsonPayload();
     string detail = payload is json ? describeGeminiError(payload) : "";
+    // A gateway or proxy rejecting the request ahead of Gemini answers in HTML or plain
+    // text, not the JSON error envelope. Falling back to the raw body keeps the reason
+    // visible instead of reporting a bare status code.
+    if detail.length() == 0 {
+        string|error textPayload = response.getTextPayload();
+        if textPayload is string {
+            string trimmed = textPayload.trim();
+            detail = trimmed.length() > 200 ? trimmed.substring(0, 200) : trimmed;
+        }
+    }
     return error ai:LlmError(detail.length() > 0
             ? string `Gemini API streaming request failed with status ${response.statusCode}: ${detail}`
             : string `Gemini API streaming request failed with status ${response.statusCode}`);

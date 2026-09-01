@@ -24,14 +24,24 @@ final ai:ChatCompletionFunctions streamWeatherTool = {
 };
 
 // Drains a chunk stream into a list, so assertions can address the whole exchange.
+//
+// Iterates with `next()` rather than a query expression on purpose: `check from ... in
+// stream` propagates a failed chunk's error *cause* rather than the error itself, which
+// would strip the `ai:Error` subtype the provider reports and leave these tests asserting
+// against `lang.value` internals.
 function collectChunks(stream<ai:ChatCompletionChunk, ai:Error?> chunks)
         returns ai:ChatCompletionChunk[]|ai:Error {
     ai:ChatCompletionChunk[] collected = [];
-    check from ai:ChatCompletionChunk chunk in chunks
-        do {
-            collected.push(chunk);
-        };
-    return collected;
+    while true {
+        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = chunks.next();
+        if next is () {
+            return collected;
+        }
+        if next is ai:Error {
+            return next;
+        }
+        collected.push(next.value);
+    }
 }
 
 // Concatenates the text fragments of a collected chunk list.
@@ -62,6 +72,11 @@ function testChatStreamYieldsTextFragments() returns error? {
             "Gemini's 'model' role should normalize to 'assistant'");
     test:assertEquals(collected[0].id, STREAM_RESPONSE_ID);
     test:assertEquals(collected[0].model, STREAM_MODEL_VERSION);
+    // Gemini stamps "model" on every chunk, but the normalized delta documents the role as
+    // sent only on the first, so the repeats must not be passed through.
+    test:assertEquals(collected[1].choices[0].delta.role, (),
+            "the role belongs on the first delta only");
+    test:assertEquals(collected[2].choices[0].delta.role, ());
 }
 
 @test:Config {}
@@ -188,7 +203,16 @@ function testChatStreamMapsSafetyStopToContentFilter() returns error? {
         check provider->chatStream([{role: ai:USER, content: "Stream filtered output"}]);
     ai:ChatCompletionChunk[] collected = check collectChunks(chunks);
 
+    // Gemini omits `parts` altogether on this chunk. It still has to arrive: dropping it as
+    // unparseable would strand the consumer with a stream that ended on no finish reason.
+    test:assertEquals(collected.length(), 1, "a parts-less terminal chunk must still surface");
     test:assertEquals(collected[0].choices[0].finishReason, ai:CONTENT_FILTER);
+    test:assertEquals(collected[0].choices[0].delta.content, ());
+    ai:CompletionTokenUsage? usage = collected[0].usage;
+    if usage is () {
+        test:assertFail("usage riding on the terminal chunk must survive with it");
+    }
+    test:assertEquals(usage.totalTokens, 19);
 }
 
 @test:Config {}
@@ -226,3 +250,49 @@ function testGenerateStreamRejectsNonStringType() {
     }
     test:assertTrue(result.message().includes("only 'string'"), result.message());
 }
+
+@test:Config {}
+function testChatStreamSurfacesMidStreamErrorEnvelope() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
+        check provider->chatStream([{role: ai:USER, content: "Stream mid error now"}]);
+
+    // Gemini can fail after a 2xx status line. Every field of the response type is
+    // optional, so the `{"error": ...}` frame converts cleanly into an empty chunk — if it
+    // is not recognized, the caller keeps the half-written answer and is told nothing.
+    ai:ChatCompletionChunk[]|ai:Error collected = collectChunks(chunks);
+    if collected !is ai:Error {
+        test:assertFail("a mid-stream error frame should terminate the stream with an error");
+    }
+    test:assertTrue(collected.message().includes("UNAVAILABLE"), collected.message());
+    test:assertTrue(collected.message().includes("The model is overloaded."), collected.message());
+}
+
+@test:Config {}
+function testChatStreamSurfacesBlockedPrompt() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
+        check provider->chatStream([{role: ai:USER, content: "Stream blocked prompt now"}]);
+
+    // `chat` raises `LlmInvalidResponseError` for a blocked prompt; the streamed path has to
+    // agree, or a rejection is indistinguishable from the model having nothing to say.
+    ai:ChatCompletionChunk[]|ai:Error collected = collectChunks(chunks);
+    if collected !is ai:Error {
+        test:assertFail("a blocked prompt should terminate the stream with an error");
+    }
+    test:assertTrue(collected is ai:LlmInvalidResponseError, collected.message());
+    test:assertTrue(collected.message().includes("SAFETY"), collected.message());
+}
+
+@test:Config {}
+function testChatStreamSurfacesMalformedChunk() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
+        check provider->chatStream([{role: ai:USER, content: "Stream malformed chunk now"}]);
+
+    // Skipping an unparseable frame would silently drop whatever it carried — including a
+    // finish reason or the token usage.
+    ai:ChatCompletionChunk[]|ai:Error collected = collectChunks(chunks);
+    if collected !is ai:Error {
+        test:assertFail("a malformed frame should terminate the stream with an error");
+    }
+    test:assertTrue(collected is ai:LlmInvalidResponseError, collected.message());
+}
+

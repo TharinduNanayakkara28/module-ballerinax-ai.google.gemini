@@ -35,7 +35,7 @@ import io.ballerina.runtime.api.values.BTypedesc;
  * unpacking its fields: the helper streams by calling {@code chatStream} as a remote
  * method on the provider, so it needs the object itself.
  *
- * @since 1.1.0
+ * @since 1.0.2
  */
 public class StreamGenerator {
     public static Object generateStream(Environment env, BObject modelProvider,

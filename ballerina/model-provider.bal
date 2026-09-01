@@ -169,6 +169,10 @@ public isolated distinct client class ModelProvider {
     # The request body is identical to the non-streaming one; only the method and the
     # `alt=sse` transport differ, so `buildGenerateContentRequest` is shared with `chat`.
     #
+    # The client's `timeout` (`ConnectionConfig`, 60s by default) governs a streamed call as
+    # it does any other. A thinking model can spend a long time before emitting its first
+    # chunk, so raise it on the connection configuration if long generations are expected.
+    #
     # + messages - List of chat messages or a single user message
     # + tools - Tool definitions to be used for the tool call
     # + stop - Stop sequence to stop the completion
@@ -176,7 +180,32 @@ public isolated distinct client class ModelProvider {
     remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools = [], string? stop = ())
             returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
-        GenerateContentRequest request = check self.buildGenerateContentRequest(messages, tools, stop);
+        // Instrumented exactly as `chat` is: a streamed call is no less a model call, and
+        // leaving it untraced would blank out tokens, prompts and finish reasons for any
+        // agent that streams. The span outlives this method — it is handed to the iterator,
+        // which closes it when the stream ends.
+        observe:ChatSpan span = observe:createChatSpan(self.modelType);
+        span.addProvider("gemini");
+        if stop is string {
+            span.addStopSequence(stop);
+        }
+        decimal? spanTemperature = self.temperature;
+        if spanTemperature is decimal {
+            span.addTemperature(spanTemperature);
+        }
+        json|ai:Error inputMessage = convertMessageToJson(messages);
+        if inputMessage is json {
+            span.addInputMessages(inputMessage);
+        }
+
+        GenerateContentRequest|ai:Error request = self.buildGenerateContentRequest(messages, tools, stop);
+        if request is ai:Error {
+            span.close(request);
+            return request;
+        }
+        if tools.length() > 0 {
+            span.addTools(tools);
+        }
 
         map<string|string[]> headers = {[API_KEY_HEADER]: self.apiKey};
         // `alt=sse` is required. Without it `:streamGenerateContent` returns the chunks as a
@@ -185,21 +214,27 @@ public isolated distinct client class ModelProvider {
         string path = string `/models/${self.modelType}:streamGenerateContent?alt=sse`;
         http:Response|error response = self.httpClient->post(path, request, headers);
         if response is error {
-            return mapHttpError(response);
+            ai:Error err = mapHttpError(response);
+            span.close(err);
+            return err;
         }
         // With `http:Response` as the target type the client surfaces 4xx/5xx as an ordinary
         // response instead of an error, so the status has to be checked here; otherwise a
         // rejected key or bad request would only surface downstream as an empty SSE stream.
         if response.statusCode < 200 || response.statusCode >= 300 {
-            return mapStreamErrorResponse(response);
+            ai:Error err = mapStreamErrorResponse(response);
+            span.close(err);
+            return err;
         }
         stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
         if sseStream is error {
-            return error ai:Error("Failed to open the SSE stream from the model", sseStream);
+            ai:Error err = error ai:Error("Failed to open the SSE stream from the model", sseStream);
+            span.close(err);
+            return err;
         }
         // Bound to an explicitly typed local before returning: `new (...)` cannot infer the
         // stream's type parameters when the enclosing function returns a union.
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new GeminiChunkIterator(sseStream));
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new GeminiChunkIterator(sseStream, span));
         return chunkStream;
     }
 
@@ -573,22 +608,38 @@ isolated function convertMessageToJson(ai:ChatMessage[]|ai:ChatMessage messages)
 # simply ends, so exhaustion of the underlying SSE stream is the only termination signal.
 class GeminiChunkIterator {
     private stream<http:SseEvent, error?> sseStream;
-    // Tool calls are numbered across the whole stream: Gemini assigns them no index of its
-    // own, while the normalized contract keys tool-call accumulation by one. See `toAiChunk`.
-    private int toolCallIndex = 0;
+    // Cross-chunk state: the running tool-call index (Gemini assigns none of its own, while
+    // the normalized contract keys accumulation by one) and whether the role has been
+    // reported yet. See `toAiChunk`.
+    private StreamState streamState = {};
+    // Set once the stream has ended, whether by exhaustion, failure or an explicit `close`.
+    private boolean done = false;
+    // The chat span opened by `chatStream`. A streamed call finishes long after the method
+    // that started it has returned, so the span can only be closed from here.
+    private final observe:ChatSpan span;
 
-    isolated function init(stream<http:SseEvent, error?> sseStream) {
+    isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
         self.sseStream = sseStream;
+        self.span = span;
     }
 
     public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        // A stream that has already failed or ended must not be read again: the underlying
+        // SSE stream is closed by then, and re-entering would report a spurious transport
+        // error in place of the failure the caller was already given.
+        if self.isDone() {
+            return ();
+        }
         while true {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
             if event is () {
+                if !self.markDone() {
+                    self.span.close();
+                }
                 return ();
             }
             if event is error {
-                return error ai:Error("Error while reading the model stream", event);
+                return self.endWithError(error ai:LlmConnectionError("Error while reading the model stream", event));
             }
             string? data = event.value.data;
             if data is () {
@@ -600,20 +651,54 @@ class GeminiChunkIterator {
             }
             json|error payload = trimmedData.fromJsonString();
             if payload is error {
-                continue;
+                return self.endWithError(error ai:LlmInvalidResponseError(
+                        "Malformed chunk received from the model stream", payload));
+            }
+            // Gemini can report a failure mid-stream as an `{"error": {...}}` frame on a
+            // stream whose status line was already 2xx. Every field of
+            // `GenerateContentResponse` is optional, so such a frame converts cleanly into
+            // an empty response — it has to be recognized before conversion, or the answer
+            // is silently truncated and reported as a normal completion.
+            string errorDetail = describeGeminiError(payload);
+            if errorDetail.length() > 0 {
+                return self.endWithError(error ai:LlmError(
+                        string `Gemini API streaming request failed: ${errorDetail}`));
             }
             GenerateContentResponse|error wireChunk = payload.cloneWithType();
             if wireChunk is error {
+                return self.endWithError(error ai:LlmInvalidResponseError(
+                        "Invalid chunk received from the model stream", wireChunk));
+            }
+            // A chunk with no candidates carries no generation. Gemini uses that shape to
+            // report a prompt its safety filters rejected, which `chat` raises as an error
+            // rather than passing off as an empty turn; the streamed path must agree, or a
+            // blocked prompt looks like the model simply had nothing to say.
+            Candidate[]? candidates = wireChunk.candidates;
+            if candidates is () || candidates.length() == 0 {
+                PromptFeedback? feedback = wireChunk.promptFeedback;
+                if feedback is PromptFeedback && feedback.blockReason is string {
+                    return self.endWithError(error ai:LlmInvalidResponseError(
+                            buildEmptyCandidatesMessage(wireChunk)));
+                }
+                // Otherwise it is an interstitial frame with nothing in it; emitting a
+                // choice-less chunk would only make the consumer filter it back out.
                 continue;
             }
-            [ai:ChatCompletionChunk, int] [chunk, nextToolCallIndex] =
-                toAiChunk(wireChunk, self.toolCallBase());
-            self.advanceToolCallIndex(nextToolCallIndex);
+            self.recordChunkTelemetry(wireChunk, candidates);
+            [ai:ChatCompletionChunk, StreamState] [chunk, nextState] =
+                toAiChunk(wireChunk, self.currentState());
+            self.advanceState(nextState);
             return {value: chunk};
         }
     }
 
     public isolated function close() returns ai:Error? {
+        // Already released on the failure path; closing a second time is not an error to
+        // report back to the caller, who is closing exactly as the contract asks.
+        if self.markDone() {
+            return ();
+        }
+        self.span.close();
         error? result = self.sseStream.close();
         if result is error {
             return error ai:Error("Error while closing the model stream", result);
@@ -621,17 +706,68 @@ class GeminiChunkIterator {
         return ();
     }
 
-    // The running tool-call index is read and advanced through these two accessors so the
-    // mutation stays lock-guarded, as an isolated method requires.
-    private isolated function toolCallBase() returns int {
+    // Ends the stream on a failure: marks it done and releases the underlying connection
+    // before handing the error back. Without this the SSE stream — and the socket behind
+    // it — stays open for the lifetime of the client, since a caller that receives an error
+    // from `next()` has no reason to also call `close()`.
+    private isolated function endWithError(ai:Error err) returns ai:Error {
+        if !self.markDone() {
+            self.span.close(err);
+            // Nothing useful can be done with a failure to close a stream that has already
+            // failed; the error the caller is being handed is the one that matters.
+            error? closeResult = self.sseStream.close();
+            if closeResult is error {
+                // Discarded deliberately - see above.
+            }
+        }
+        return err;
+    }
+
+    // Records what a chunk reveals about the completed call. Only the chunk carrying a
+    // finish reason is worth recording: Gemini repeats a cumulative `usageMetadata` on
+    // every chunk, so the figures are complete only there, and recording each one would
+    // overwrite the span's counts many times over.
+    //
+    // Answer text is deliberately not accumulated onto the span: buffering the whole
+    // response to record it would defeat the point of streaming it.
+    private isolated function recordChunkTelemetry(GenerateContentResponse wireChunk, Candidate[] candidates) {
+        string? finishReason = candidates[0].finishReason;
+        if finishReason is () {
+            return;
+        }
+        recordResponseTelemetry(self.span, wireChunk);
+        self.span.addFinishReason(finishReason);
+        self.span.addOutputType(observe:TEXT);
+    }
+
+    private isolated function isDone() returns boolean {
         lock {
-            return self.toolCallIndex;
+            return self.done;
         }
     }
 
-    private isolated function advanceToolCallIndex(int next) {
+    // Marks the stream done, returning whether it was already marked before this call.
+    private isolated function markDone() returns boolean {
         lock {
-            self.toolCallIndex = next;
+            boolean wasDone = self.done;
+            self.done = true;
+            return wasDone;
+        }
+    }
+
+    // Cross-chunk state is read and advanced through these two accessors so the mutation
+    // stays lock-guarded, as an isolated method requires. Both clone across the lock
+    // boundary: the record is mutable, so handing out or storing a live reference would
+    // leak access to it from outside the lock.
+    private isolated function currentState() returns StreamState {
+        lock {
+            return self.streamState.clone();
+        }
+    }
+
+    private isolated function advanceState(StreamState next) {
+        lock {
+            self.streamState = next.clone();
         }
     }
 }
