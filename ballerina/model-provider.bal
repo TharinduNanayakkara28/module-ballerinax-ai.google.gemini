@@ -176,10 +176,10 @@ public isolated distinct client class ModelProvider {
     # + messages - List of chat messages or a single user message
     # + tools - Tool definitions to be used for the tool call
     # + stop - Stop sequence to stop the completion
-    # + return - A stream of chat completion chunks, or an error in-case of failures
-    remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
+    # + return - A stream of assistant message chunks, or an error in-case of failures
+    remote function chatAsStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools = [], string? stop = ())
-            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+            returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error {
         // Instrumented exactly as `chat` is: a streamed call is no less a model call, and
         // leaving it untraced would blank out tokens, prompts and finish reasons for any
         // agent that streams. The span outlives this method — it is handed to the iterator,
@@ -206,36 +206,7 @@ public isolated distinct client class ModelProvider {
         if tools.length() > 0 {
             span.addTools(tools);
         }
-
-        map<string|string[]> headers = {[API_KEY_HEADER]: self.apiKey};
-        // `alt=sse` is required. Without it `:streamGenerateContent` returns the chunks as a
-        // single incrementally-written JSON array rather than as Server-Sent Events, and
-        // `getSseEventStream` would have nothing to parse.
-        string path = string `/models/${self.modelType}:streamGenerateContent?alt=sse`;
-        http:Response|error response = self.httpClient->post(path, request, headers);
-        if response is error {
-            ai:Error err = mapHttpError(response);
-            span.close(err);
-            return err;
-        }
-        // With `http:Response` as the target type the client surfaces 4xx/5xx as an ordinary
-        // response instead of an error, so the status has to be checked here; otherwise a
-        // rejected key or bad request would only surface downstream as an empty SSE stream.
-        if response.statusCode < 200 || response.statusCode >= 300 {
-            ai:Error err = mapStreamErrorResponse(response);
-            span.close(err);
-            return err;
-        }
-        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
-        if sseStream is error {
-            ai:Error err = error ai:Error("Failed to open the SSE stream from the model", sseStream);
-            span.close(err);
-            return err;
-        }
-        // Bound to an explicitly typed local before returning: `new (...)` cannot infer the
-        // stream's type parameters when the enclosing function returns a union.
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new GeminiChunkIterator(sseStream, span));
-        return chunkStream;
+        return self.openChunkStream(request, span);
     }
 
     # Sends a chat request to the model and generates a value that belongs to the type
@@ -249,15 +220,45 @@ public isolated distinct client class ModelProvider {
     } external;
 
     # Sends a streaming chat request to the model using the given prompt and streams back
-    # the generated answer. Only `string` is supported as the expected type.
+    # the generated answer as text fragments.
+    #
+    # Streaming produces text only: structured types have no valid intermediate state, so
+    # use `generate` for structured output. The request is built from the prompt the same
+    # way `generate` builds it — text and image/file content parts via
+    # `generateChatCreationContent` — rather than through `chatAsStream`'s message handling,
+    # so a `generateAsStream` prompt may carry images, PDFs and `ai:FileId` insertions.
     #
     # + prompt - The prompt to use in the chat request
-    # + td - The expected type of the streamed value; must be `string`
-    # + return - A stream of the generated value, or an error if the type is unsupported
-    remote function generateStream(ai:Prompt prompt, @display {label: "Expected type"} typedesc<anydata> td = <>)
-            returns stream<td, ai:Error?>|ai:Error = @java:Method {
-        'class: "io.ballerina.lib.ai.google.gemini.StreamGenerator"
-    } external;
+    # + return - A stream of text fragments, or an error if generation fails
+    remote function generateAsStream(ai:Prompt prompt) returns stream<string, ai:Error?>|ai:Error {
+        observe:GenerateContentSpan span = observe:createGenerateContentSpan(self.modelType);
+        span.addProvider("gemini");
+        decimal? spanTemperature = self.temperature;
+        if spanTemperature is decimal {
+            span.addTemperature(spanTemperature);
+        }
+
+        Part[]|ai:Error parts = generateChatCreationContent(prompt);
+        if parts is ai:Error {
+            span.close(parts);
+            return parts;
+        }
+        Content[] contents = [{role: GEMINI_ROLE_USER, parts}];
+        span.addInputMessages(contents.toJson());
+
+        GenerationConfig generationConfig = {maxOutputTokens: self.maxTokens};
+        decimal? temperature = self.temperature;
+        if temperature is decimal {
+            generationConfig.temperature = temperature;
+        }
+        GenerateContentRequest request = {contents, generationConfig};
+
+        stream<ai:ChatMessageChunk, ai:Error?>|ai:Error chunks = self.openChunkStream(request, span);
+        if chunks is ai:Error {
+            return chunks;
+        }
+        return new stream<string, ai:Error?>(new ChunkTextIterator(chunks));
+    }
 
     # Builds a Gemini `generateContent` request from the normalized `ai` chat messages.
     # System messages are collapsed into a single `systemInstruction`; user, assistant
@@ -321,6 +322,49 @@ public isolated distinct client class ModelProvider {
             request.tools = [{functionDeclarations: convertTools(tools)}];
         }
         return request;
+    }
+
+    # Opens a `:streamGenerateContent?alt=sse` call for `request` and wraps the resulting
+    # SSE stream as normalized `ai:ChatMessageChunk`s. Shared by `chatAsStream` and
+    # `generateAsStream`, which differ only in how `request` and `span` are built.
+    #
+    # The span is closed here if the connection fails; otherwise the returned stream's
+    # iterator closes it when the stream ends, errors, or is closed early by the caller.
+    #
+    # + request - The assembled `:generateContent`-shaped request body
+    # + span - The chat or generate-content span opened by the caller
+    # + return - A stream of normalized chunks, or an `ai:Error` if the call could not be opened
+    private isolated function openChunkStream(GenerateContentRequest request, observe:LlmSpan span)
+            returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error {
+        map<string|string[]> headers = {[API_KEY_HEADER]: self.apiKey};
+        // `alt=sse` is required. Without it `:streamGenerateContent` returns the chunks as a
+        // single incrementally-written JSON array rather than as Server-Sent Events, and
+        // `getSseEventStream` would have nothing to parse.
+        string path = string `/models/${self.modelType}:streamGenerateContent?alt=sse`;
+        http:Response|error response = self.httpClient->post(path, request, headers);
+        if response is error {
+            ai:Error err = mapHttpError(response);
+            closeSpan(span, err);
+            return err;
+        }
+        // With `http:Response` as the target type the client surfaces 4xx/5xx as an ordinary
+        // response instead of an error, so the status has to be checked here; otherwise a
+        // rejected key or bad request would only surface downstream as an empty SSE stream.
+        if response.statusCode < 200 || response.statusCode >= 300 {
+            ai:Error err = mapStreamErrorResponse(response);
+            closeSpan(span, err);
+            return err;
+        }
+        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
+        if sseStream is error {
+            ai:Error err = error ai:Error("Failed to open the SSE stream from the model", sseStream);
+            closeSpan(span, err);
+            return err;
+        }
+        // Bound to an explicitly typed local before returning: `new (...)` cannot infer the
+        // stream's type parameters when the enclosing function returns a union.
+        stream<ai:ChatMessageChunk, ai:Error?> chunkStream = new (new GeminiChunkIterator(sseStream, span));
+        return chunkStream;
     }
 }
 
@@ -599,31 +643,47 @@ isolated function convertMessageToJson(ai:ChatMessage[]|ai:ChatMessage messages)
         {role: messages.role, content: check getChatMessageStringContent(messages.content), name: messages.name};
 }
 
+# Closes an `observe:LlmSpan`, working around `close` not resolving directly on the
+# `LlmSpan` abstract type when called from outside the `ballerina/ai` package — it is
+# inherited via `*observe:AiSpan;` type inclusion, and that inclusion does not appear to
+# be visible across module boundaries in the pinned `ballerina/ai` build this connector
+# targets. Re-typing the value as `observe:AiSpan` — a plain assignment, since `LlmSpan`
+# is a structural subtype of it — resolves `close` where calling it directly on the
+# `LlmSpan`-typed value does not.
+#
+# + span - The span to close
+# + err - The error that ended the operation, if any
+isolated function closeSpan(observe:LlmSpan span, error? err = ()) {
+    observe:AiSpan aiSpan = span;
+    aiSpan.close(err);
+}
+
 # Iterator that converts Gemini's Server-Sent Event stream into a stream of normalized
-# `ai:ChatCompletionChunk` values. Each `data:` payload is parsed as a
+# `ai:ChatMessageChunk` values. Each `data:` payload is parsed as a
 # `GenerateContentResponse` — streamed chunks share the non-streaming response shape — and
-# mapped via `toAiChunk`. Blank lines and keep-alive comments are skipped.
+# mapped via `toAiChunk`. Blank lines, keep-alive comments and events that carry nothing
+# for the caller (a role-only echo, a usage-only frame) are skipped.
 #
 # Gemini sends no end-of-stream sentinel (there is no OpenAI-style `[DONE]`); the stream
 # simply ends, so exhaustion of the underlying SSE stream is the only termination signal.
 class GeminiChunkIterator {
     private stream<http:SseEvent, error?> sseStream;
-    // Cross-chunk state: the running tool-call index (Gemini assigns none of its own, while
-    // the normalized contract keys accumulation by one) and whether the role has been
-    // reported yet. See `toAiChunk`.
+    // Cross-chunk state: the running tool-call index. Gemini assigns none of its own, while
+    // the normalized contract keys accumulation by one. See `toAiChunk`.
     private StreamState streamState = {};
     // Set once the stream has ended, whether by exhaustion, failure or an explicit `close`.
     private boolean done = false;
-    // The chat span opened by `chatStream`. A streamed call finishes long after the method
-    // that started it has returned, so the span can only be closed from here.
-    private final observe:ChatSpan span;
+    // The span opened by `chatAsStream`/`generateAsStream`. A streamed call finishes long
+    // after the method that started it has returned, so the span can only be closed from
+    // here.
+    private final observe:LlmSpan span;
 
-    isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
+    isolated function init(stream<http:SseEvent, error?> sseStream, observe:LlmSpan span) {
         self.sseStream = sseStream;
         self.span = span;
     }
 
-    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+    public isolated function next() returns record {|ai:ChatMessageChunk value;|}|ai:Error? {
         // A stream that has already failed or ended must not be read again: the underlying
         // SSE stream is closed by then, and re-entering would report a spurious transport
         // error in place of the failure the caller was already given.
@@ -634,7 +694,7 @@ class GeminiChunkIterator {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
             if event is () {
                 if !self.markDone() {
-                    self.span.close();
+                    closeSpan(self.span);
                 }
                 return ();
             }
@@ -680,14 +740,20 @@ class GeminiChunkIterator {
                     return self.endWithError(error ai:LlmInvalidResponseError(
                             buildEmptyCandidatesMessage(wireChunk)));
                 }
-                // Otherwise it is an interstitial frame with nothing in it; emitting a
-                // choice-less chunk would only make the consumer filter it back out.
+                // Otherwise it is an interstitial frame with nothing in it; emitting an
+                // empty chunk would only make the consumer filter it back out.
                 continue;
             }
-            self.recordChunkTelemetry(wireChunk, candidates);
-            [ai:ChatCompletionChunk, StreamState] [chunk, nextState] =
-                toAiChunk(wireChunk, self.currentState());
+            Candidate candidate = candidates[0];
+            self.recordChunkTelemetry(wireChunk, candidate);
+            [ai:ChatMessageChunk, StreamState] [chunk, nextState] =
+                toAiChunk(wireChunk, candidate, self.currentState());
             self.advanceState(nextState);
+            // A chunk carrying no content, reasoning, tool calls or finish reason is a pure
+            // echo (e.g. a role-only frame) and has nothing for the caller.
+            if chunk.content is () && chunk.reasoning is () && chunk.toolCalls is () && chunk.finishReason is () {
+                continue;
+            }
             return {value: chunk};
         }
     }
@@ -698,7 +764,7 @@ class GeminiChunkIterator {
         if self.markDone() {
             return ();
         }
-        self.span.close();
+        closeSpan(self.span);
         error? result = self.sseStream.close();
         if result is error {
             return error ai:Error("Error while closing the model stream", result);
@@ -712,7 +778,7 @@ class GeminiChunkIterator {
     // from `next()` has no reason to also call `close()`.
     private isolated function endWithError(ai:Error err) returns ai:Error {
         if !self.markDone() {
-            self.span.close(err);
+            closeSpan(self.span, err);
             // Nothing useful can be done with a failure to close a stream that has already
             // failed; the error the caller is being handed is the one that matters.
             error? closeResult = self.sseStream.close();
@@ -730,8 +796,8 @@ class GeminiChunkIterator {
     //
     // Answer text is deliberately not accumulated onto the span: buffering the whole
     // response to record it would defeat the point of streaming it.
-    private isolated function recordChunkTelemetry(GenerateContentResponse wireChunk, Candidate[] candidates) {
-        string? finishReason = candidates[0].finishReason;
+    private isolated function recordChunkTelemetry(GenerateContentResponse wireChunk, Candidate candidate) {
+        string? finishReason = candidate.finishReason;
         if finishReason is () {
             return;
         }
@@ -772,53 +838,26 @@ class GeminiChunkIterator {
     }
 }
 
-# Builds the string stream behind the dependently-typed `generateStream`. The native
-# `StreamGenerator` shim trampolines here so the type gating stays in Ballerina. Only
-# `string` is supported; other types yield an error, because a partial generation is a
-# valid value only for `string`. When valid, the underlying `chatStream` chunks are
-# projected onto their text fragments.
-#
-# Not `isolated`: it calls the non-isolated `chatStream`.
-#
-# + llmModel - The model provider whose `chatStream` supplies the chunks
-# + prompt - The prompt to send to the model
-# + td - The caller's expected type; must be `string`
-# + return - A stream of text fragments, or an error if the type is unsupported
-function generateLlmResponseStream(ModelProvider llmModel, ai:Prompt prompt, typedesc<anydata> td)
-        returns stream<string, ai:Error?>|ai:Error {
-    if td !is typedesc<string> {
-        return error ai:Error("This data type is not supported for streaming. " +
-                "'generateStream' supports only 'string'; use 'generate' for structured types.");
-    }
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check llmModel->chatStream({role: ai:USER, content: prompt});
-    stream<string, ai:Error?> textStream = new (new ChunkTextIterator(chunks));
-    return textStream;
-}
-
-# Projects a normalized `ai:ChatCompletionChunk` stream onto its text content, yielding
-# each non-empty `delta.content` fragment and skipping tool-call, reasoning and usage-only
-# chunks. Backs `generateLlmResponseStream`.
+# Projects a normalized `ai:ChatMessageChunk` stream onto its text content, yielding each
+# non-empty `content` fragment and skipping tool-call, reasoning and finish-only chunks.
+# Backs `generateAsStream`.
 class ChunkTextIterator {
-    private stream<ai:ChatCompletionChunk, ai:Error?> chunks;
+    private stream<ai:ChatMessageChunk, ai:Error?> chunks;
 
-    isolated function init(stream<ai:ChatCompletionChunk, ai:Error?> chunks) {
+    isolated function init(stream<ai:ChatMessageChunk, ai:Error?> chunks) {
         self.chunks = chunks;
     }
 
     public isolated function next() returns record {|string value;|}|ai:Error? {
         while true {
-            record {|ai:ChatCompletionChunk value;|}|ai:Error? next = self.chunks.next();
+            record {|ai:ChatMessageChunk value;|}|ai:Error? next = self.chunks.next();
             if next is () {
                 return ();
             }
             if next is ai:Error {
                 return next;
             }
-            ai:ChatCompletionChunkChoice[] choices = next.value.choices;
-            if choices.length() == 0 {
-                continue;
-            }
-            string? content = choices[0].delta.content;
+            string? content = next.value.content;
             if content is string && content.length() > 0 {
                 return {value: content};
             }

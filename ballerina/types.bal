@@ -417,22 +417,19 @@ type BatchEmbedContentsResponse record {
 // `:streamGenerateContent?alt=sse` emits one SSE `data:` event per chunk, each carrying a
 // `GenerateContentResponse` of the same shape as a non-streaming response — so the wire
 // types above are reused rather than duplicated. These functions project that onto the
-// provider-agnostic `ai:ChatCompletionChunk` that `chatStream` must return.
+// provider-agnostic `ai:ChatMessageChunk` that `chatAsStream` must return.
 // Reference: https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent
 
 # What one streamed chunk needs to know about the chunks that preceded it.
 #
-# Gemini treats every chunk as self-contained — it repeats the role on each one and numbers
-# no tool call — whereas the normalized contract describes a single message assembled across
-# chunks. This carries the little bit of cross-chunk state that gap requires.
+# Gemini numbers no tool call of its own, whereas the normalized contract keys tool-call
+# accumulation by an `index`. This carries the running counter that gap requires.
 type StreamState record {|
     # The next unused tool-call index
     int toolCallIndex = 0;
-    # Whether an earlier delta has already reported the role
-    boolean roleReported = false;
 |};
 
-# Maps one streamed Gemini chunk onto the normalized `ai:ChatCompletionChunk`.
+# Maps one streamed Gemini chunk onto the normalized `ai:ChatMessageChunk`.
 #
 # Unlike OpenAI-compatible APIs, Gemini does not fragment function-call arguments across
 # chunks: a `functionCall` part arrives with its `args` object already complete. Each such
@@ -441,143 +438,75 @@ type StreamState record {|
 # calls no index of its own, so one is assigned from a counter running across the whole
 # stream, threaded in and out through `state`.
 #
-# That counter is shared across the candidates of a chunk rather than restarting per
-# candidate. This connector never sets `candidateCount`, so Gemini returns exactly one
-# candidate and the distinction cannot arise; were multiple candidates ever requested, the
-# indices would need to be tracked per candidate instead.
+# `role` is set on every returned chunk, as the normalized contract requires. This
+# connector never sets `candidateCount`, so `candidate` is always Gemini's sole candidate
+# for this chunk; the caller is responsible for picking it out of `w.candidates`.
 #
-# + w - The parsed chunk
+# + w - The parsed chunk, consulted for the response id and (on the terminal chunk) usage
+# + candidate - The chunk's sole candidate
 # + state - What the chunks before this one established
 # + return - The normalized chunk, and the state carried forward past it
-isolated function toAiChunk(GenerateContentResponse w, StreamState state)
-        returns [ai:ChatCompletionChunk, StreamState] {
+isolated function toAiChunk(GenerateContentResponse w, Candidate candidate, StreamState state)
+        returns [ai:ChatMessageChunk, StreamState] {
     int toolCallIndex = state.toolCallIndex;
-    boolean roleReported = state.roleReported;
-    ai:ChatCompletionChunkChoice[] choices = [];
-    boolean terminal = false;
+    string text = "";
+    string reasoning = "";
+    ai:ToolCallChunk[] toolCalls = [];
 
-    foreach Candidate candidate in w.candidates ?: [] {
-        ai:ChatCompletionChunkDelta delta = {};
-        string text = "";
-        string reasoning = "";
-        ai:ToolCallChunk[] toolCalls = [];
-
-        Content? content = candidate.content;
-        if content is Content {
-            // Gemini stamps the role on every chunk; the normalized delta documents it as
-            // sent only on the first, so later repeats are dropped.
-            ai:ROLE? role = mapRole(content.role);
-            if role is ai:ROLE && !roleReported {
-                delta.role = role;
-                roleReported = true;
-            }
-            foreach Part part in content.parts {
-                string? partText = part.text;
-                if partText is string {
-                    // A thought part is chain-of-thought, not answer text; folding it into
-                    // `content` would leak the model's reasoning into the reply.
-                    if part.thought == true {
-                        reasoning += partText;
-                    } else {
-                        text += partText;
-                    }
-                }
-                FunctionCall? functionCall = part.functionCall;
-                if functionCall is FunctionCall {
-                    ai:ToolCallChunk toolCall = {
-                        index: toolCallIndex,
-                        'function: {
-                            name: functionCall.name,
-                            arguments: (functionCall.args ?: {}).toJsonString()
-                        }
-                    };
-                    // Gemini 3 rejects a replay of this call that has lost the signature it
-                    // arrived with, and `ai:ToolCallChunk` has no field to hold one, so it
-                    // rides on the id exactly as it does on the non-streaming path. The whole
-                    // stream is a single model turn, so every call after the first is marked
-                    // a continuation of the turn the first one opened.
-                    string? id = packToolCallId(functionCall.id, part.thoughtSignature, toolCallIndex > 0);
-                    if id is string {
-                        toolCall.id = id;
-                    }
-                    toolCalls.push(toolCall);
-                    toolCallIndex += 1;
+    Content? content = candidate.content;
+    if content is Content {
+        foreach Part part in content.parts {
+            string? partText = part.text;
+            if partText is string {
+                // A thought part is chain-of-thought, not answer text; folding it into
+                // `content` would leak the model's reasoning into the reply.
+                if part.thought == true {
+                    reasoning += partText;
+                } else {
+                    text += partText;
                 }
             }
+            FunctionCall? functionCall = part.functionCall;
+            if functionCall is FunctionCall {
+                ai:ToolCallChunk toolCall = {
+                    index: toolCallIndex,
+                    name: functionCall.name,
+                    arguments: (functionCall.args ?: {}).toJsonString()
+                };
+                // Gemini 3 rejects a replay of this call that has lost the signature it
+                // arrived with, and `ai:ToolCallChunk` has no field to hold one, so it
+                // rides on the id exactly as it does on the non-streaming path. The whole
+                // stream is a single model turn, so every call after the first is marked
+                // a continuation of the turn the first one opened.
+                string? id = packToolCallId(functionCall.id, part.thoughtSignature, toolCallIndex > 0);
+                if id is string {
+                    toolCall.id = id;
+                }
+                toolCalls.push(toolCall);
+                toolCallIndex += 1;
+            }
         }
-
-        if text.length() > 0 {
-            delta.content = text;
-        }
-        if reasoning.length() > 0 {
-            delta.reasoning = reasoning;
-        }
-        if toolCalls.length() > 0 {
-            delta.toolCalls = toolCalls;
-        }
-
-        // `toolCallIndex` counts every call seen so far in the stream, this chunk's included,
-        // so a turn whose function call and terminal "STOP" arrive together still reports
-        // `tool_calls` rather than `stop`.
-        ai:FinishReason? finishReason = mapFinishReason(candidate.finishReason, toolCallIndex > 0);
-        if finishReason is ai:FinishReason {
-            terminal = true;
-        }
-        choices.push({index: candidate.index ?: 0, delta, finishReason});
     }
 
-    ai:ChatCompletionChunk chunk = {choices};
+    ai:ChatMessageChunk chunk = {role: ai:ASSISTANT};
+    if text.length() > 0 {
+        chunk.content = text;
+    }
+    if reasoning.length() > 0 {
+        chunk.reasoning = reasoning;
+    }
+    if toolCalls.length() > 0 {
+        chunk.toolCalls = toolCalls;
+    }
     string? responseId = w.responseId;
     if responseId is string {
         chunk.id = responseId;
     }
-    // The concrete version behind a floating alias such as "gemini-3.6-flash".
-    string? modelVersion = w.modelVersion;
-    if modelVersion is string {
-        chunk.model = modelVersion;
-    }
-    // Gemini repeats a cumulative `usageMetadata` on every chunk, whereas the normalized
-    // type documents usage as final-chunk-only. Carrying it on every chunk would let a
-    // consumer that sums chunk usage over-count many times over, so it is attached only to
-    // the chunk reporting a finish reason — where Gemini's figures are complete.
-    if terminal {
-        UsageMetadata? usage = w.usageMetadata;
-        if usage is UsageMetadata {
-            ai:CompletionTokenUsage tokenUsage = {};
-            int? promptTokens = usage.promptTokenCount;
-            if promptTokens is int {
-                tokenUsage.promptTokens = promptTokens;
-            }
-            // Candidate plus reasoning tokens: Gemini reports thinking separately even
-            // though it is billed as output. See `totalOutputTokenCount`.
-            int? completionTokens = totalOutputTokenCount(usage);
-            if completionTokens is int {
-                tokenUsage.completionTokens = completionTokens;
-            }
-            int? totalTokens = usage.totalTokenCount;
-            if totalTokens is int {
-                tokenUsage.totalTokens = totalTokens;
-            }
-            chunk.usage = tokenUsage;
-        }
-    }
-    return [chunk, {toolCallIndex, roleReported}];
-}
-
-# Safely maps a Gemini content role onto the `ai:ROLE` enum. Gemini attributes model output
-# to the "model" role, which normalizes to `ai:ASSISTANT`. Returns `()` for absent or
-# unrecognized values rather than panicking on a cast.
-#
-# + role - The role string from the streamed content
-# + return - The mapped `ai:ROLE`, or `()` when absent/unrecognized
-isolated function mapRole(string? role) returns ai:ROLE? {
-    if role == GEMINI_ROLE_MODEL {
-        return ai:ASSISTANT;
-    }
-    if role == GEMINI_ROLE_USER {
-        return ai:USER;
-    }
-    return ();
+    // `toolCallIndex` counts every call seen so far in the stream, this chunk's included,
+    // so a turn whose function call and terminal "STOP" arrive together still reports
+    // `tool_calls` rather than `stop`.
+    chunk.finishReason = mapFinishReason(candidate.finishReason, toolCallIndex > 0);
+    return [chunk, {toolCallIndex}];
 }
 
 # Safely maps a Gemini finish reason onto the `ai:FinishReason` enum, returning `()` while

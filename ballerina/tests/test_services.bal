@@ -211,6 +211,28 @@ function buildStreamResponse(string promptText) returns http:Response {
             }
         ]);
     }
+    // Same shape as "Stream tool call" — a content chunk, then a chunk that is tool-call
+    // and finish-reason only — but under a prompt prefix `validateStreamRequest` does not
+    // require tools for, since `generateAsStream` sends none. Exists so
+    // `generateAsStream`'s text-only projection can be exercised against a chunk stream
+    // that also carries a tool call, without tripping that assertion.
+    if promptText.startsWith("Generate stream tool call") {
+        return buildSseResponse([
+            streamChunk([{text: "Looking that up. "}], ()),
+            {
+                candidates: [
+                    {
+                        content: {
+                            role: "model",
+                            parts: [{functionCall: {id: "call-1", name: "getWeather", args: {city: "Colombo"}}}]
+                        },
+                        finishReason: "STOP",
+                        index: 0
+                    }
+                ]
+            }
+        ]);
+    }
     // Two calls in one streamed turn, signed once on the first — the parallel-batch shape.
     if promptText.startsWith("Stream parallel tools") {
         return buildSseResponse([
