@@ -203,8 +203,8 @@ type Part record {
     FunctionResponse functionResponse?;
     # Marks this part as the model's chain-of-thought rather than its answer. Gemini sets
     # it only when `generationConfig.thinkingConfig.includeThoughts` is requested, which
-    # this connector does not currently do — but a thought part must never be folded into
-    # answer text, so it is modelled and routed to `delta.reasoning` when streaming.
+    # `chatAsStream` does so the thought can be routed to `delta.reasoning`. It must never
+    # be folded into answer text.
     boolean thought?;
     # Opaque, encrypted record of the reasoning that produced this part. Gemini 3 models
     # return one on the `functionCall` part that opens a model turn; in a parallel batch that
@@ -266,6 +266,13 @@ type ToolConfig record {|
     FunctionCallingConfig functionCallingConfig?;
 |};
 
+# Controls the model's internal reasoning.
+type ThinkingConfig record {|
+    # Whether Gemini returns summaries of its reasoning as `thought` parts. Off by
+    # default, in which case the model still thinks but only the answer is returned
+    boolean includeThoughts?;
+|};
+
 # Generation parameters controlling sampling and output shape.
 type GenerationConfig record {|
     # Sampling temperature
@@ -286,6 +293,8 @@ type GenerationConfig record {|
     # still required. Mutually exclusive with `responseSchema` — Gemini rejects requests
     # that set both.
     map<json> responseJsonSchema?;
+    # Reasoning configuration for thinking models
+    ThinkingConfig thinkingConfig?;
 |};
 
 # A single safety category/threshold pairing.

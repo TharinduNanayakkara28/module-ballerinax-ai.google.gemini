@@ -166,8 +166,9 @@ public isolated distinct client class ModelProvider {
 
     # Sends a streaming chat request to the Gemini model with the given messages and tools.
     #
-    # The request body is identical to the non-streaming one; only the method and the
-    # `alt=sse` transport differ, so `buildGenerateContentRequest` is shared with `chat`.
+    # The request body is built by the same `buildGenerateContentRequest` as `chat`, plus
+    # `thinkingConfig.includeThoughts` so reasoning streams into `reasoning`; otherwise
+    # only the method and the `alt=sse` transport differ.
     #
     # The client's `timeout` (`ConnectionConfig`, 60s by default) governs a streamed call as
     # it does any other. A thinking model can spend a long time before emitting its first
@@ -203,6 +204,12 @@ public isolated distinct client class ModelProvider {
             span.close(request);
             return request;
         }
+        // Only the streaming chat surfaces reasoning, through `ai:ChatMessageChunk.reasoning`,
+        // so only it asks Gemini to return thought parts. Every supported model thinks, so
+        // the flag is always accepted; without it the model reasons but sends no thoughts.
+        GenerationConfig generationConfig = request.generationConfig ?: {};
+        generationConfig.thinkingConfig = {includeThoughts: true};
+        request.generationConfig = generationConfig;
         if tools.length() > 0 {
             span.addTools(tools);
         }

@@ -161,6 +161,11 @@ function validateStreamRequest(string promptText, json payload) {
     test:assertTrue(generationConfig is map<json>, "a streaming request must carry a generationConfig");
     test:assertEquals((<map<json>>generationConfig)["maxOutputTokens"], DEFAULT_MAX_TOKEN_COUNT,
             "the token ceiling must apply to streamed generations too");
+    if promptText.startsWith("Stream thoughts") {
+        json thinkingConfig = (<map<json>>generationConfig)["thinkingConfig"];
+        test:assertEquals(thinkingConfig, {includeThoughts: true},
+                "chatAsStream must ask Gemini to return thought parts");
+    }
 
     json contents = obj["contents"];
     test:assertTrue(contents is json[], "a streaming request must carry a contents array");
